@@ -10790,7 +10790,6 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
-        SESSION_FAMILY_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
@@ -10800,7 +10799,6 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
-        SESSION_FAMILY_LABEL_KEY,
     ):
         if key in labels:
             raise OmnigentError(
