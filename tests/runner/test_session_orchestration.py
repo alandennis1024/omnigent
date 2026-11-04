@@ -140,6 +140,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert requests[0].url.path == "/v1/sessions/orchestrated"
         assert "parent_session_id" not in body
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+        assert result["kind"] == "default"
+        assert "family" in result
         assert result["agent_id"] == "worker"
         assert result["title"] == "Worker task"
         register.assert_not_called()
