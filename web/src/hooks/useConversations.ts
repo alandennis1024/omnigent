@@ -1895,7 +1895,14 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     agent_id: session.agentId,
     harness: session.harness,
     archived: session.archived,
+    family: session.family,
   };
+}
+
+function invalidateFamilyLists(queryClient: QueryClient) {
+  for (const queryKey of [["conversations"], ["project-sessions"], PINNED_CONVERSATIONS_KEY]) {
+    void queryClient.invalidateQueries({ queryKey });
+  }
 }
 
 // Pin, unpin, and reorder writes share a mutation key, and a new one is refused
@@ -2117,8 +2124,7 @@ export function useTogglePinnedConversation() {
     },
     onSuccess: (updated, { pinned }) => {
       if (updated.family || findRow(updated.id)?.family) {
-        void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-        void queryClient.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
+        invalidateFamilyLists(queryClient);
         return;
       }
 
@@ -2204,6 +2210,9 @@ export function useReorderPinnedConversations() {
       });
       if (results.some((r) => r.status === "rejected")) {
         showToast("Couldn't save the pinned order.");
+      }
+      if (writes.some(({ id }) => findCachedConversationRow(queryClient, id)?.family)) {
+        invalidateFamilyLists(queryClient);
       }
     },
   });
@@ -2655,6 +2664,7 @@ async function fetchProjectSessionsPage(
     limit: String(limit),
     visibility: archived ? "all" : "mine",
     project,
+    expand_families: "true",
   });
   // The all+project path resolves owned first-class projects on older servers too.
   if (archived) params.set("include_archived", "true");

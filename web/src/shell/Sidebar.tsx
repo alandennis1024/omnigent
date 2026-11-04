@@ -258,6 +258,7 @@ import {
   moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
+  isPinOrderUnit,
   readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
@@ -1577,17 +1578,19 @@ function ProjectFolder({
     for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pins take precedence over live folders.
-    return sortConversations(
-      [...byId.values()].filter(
-        (c) =>
-          (c.archived === true) === archived &&
-          sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-          (archived || !pinnedSet.has(c.id)),
+    return orderSessionFamilies(
+      sortConversations(
+        [...byId.values()].filter(
+          (c) =>
+            (c.archived === true) === archived &&
+            sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
+            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))),
+        ),
+        activeOverride,
+        frozenSortKeys,
+        sortBy,
+        customOrder,
       ),
-      activeOverride,
-      frozenSortKeys,
-      sortBy,
-      customOrder,
     );
   }, [
     query.data,
@@ -2181,12 +2184,8 @@ function ConversationList({
         id,
         name,
         icon,
-        conversations: sortConversations(
-          inProject,
-          activeOverride,
-          frozenKeys,
-          sortBy,
-          customOrder,
+        conversations: orderSessionFamilies(
+          sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
         ),
       };
     });
@@ -2224,7 +2223,14 @@ function ConversationList({
     const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
       : allOrdered;
-    if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
+    if (!grouped)
+      return {
+        pinned,
+        shared,
+        sessions: orderSessionFamilies(ordered),
+        projectGroups,
+        groupTitles: null,
+      };
     // Buckets use render-time "now", so a day rollover shows on the next list update.
     const now = new Date();
     const groupTitles = new Map<string, string>(
@@ -2261,7 +2267,7 @@ function ConversationList({
       if (group) groupTitles.set(row.id, group);
     }
     const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
-      (g) => g.conversations,
+      (g) => orderSessionFamilies(g.conversations),
     );
     return { pinned, shared, sessions, projectGroups, groupTitles };
     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
@@ -2749,7 +2755,7 @@ function ConversationList({
     () =>
       pinReorderEnabled && !pinWriting
         ? {
-            ids: sections.pinned.map((c) => c.id),
+            ids: sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
             draggingId: activeDrag?.id ?? null,
             overId: overPin,
           }
@@ -5313,7 +5319,7 @@ function ConversationRowImpl({
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
     id: `pin-order:${conversation.id}`,
     data: { type: "pin-order", id: conversation.id },
-    disabled: !pinOrder || !isPinned,
+    disabled: !pinOrder || !isPinned || !pinOrder.ids.includes(conversation.id),
   });
   // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
   let pinInsertion: "before" | "after" | undefined;
