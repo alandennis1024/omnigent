@@ -173,7 +173,7 @@ class SiblingSessionDestinations(str, Enum):
                 return cls(value.strip().lower())
             except ValueError:
                 pass
-        return cls.ANY_HOST
+        return cls.CURRENT_HOST
 
 
 def _read_override_text(path: Path) -> str | None:

@@ -6285,6 +6285,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_bundle_workspaces": {
+            "default": true,
+            "title": "Session Bundle Workspaces",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
@@ -6316,6 +6321,16 @@
               "off"
             ],
             "title": "Sharing Mode",
+            "type": "string"
+          },
+          "sibling_session_destinations": {
+            "default": "any_host",
+            "enum": [
+              "current_host",
+              "current_host_or_new_sandbox",
+              "any_host"
+            ],
+            "title": "Sibling Session Destinations",
             "type": "string"
           },
           "sibling_sessions": {
@@ -9877,6 +9892,17 @@
               }
             ],
             "title": "Sharing Mode"
+          },
+          "sibling_session_destinations": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sibling Session Destinations"
           }
         },
         "title": "SetSharingRequest",
