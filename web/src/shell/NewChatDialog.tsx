@@ -6457,7 +6457,7 @@ function NewChatLandingContent({
           )}
           {siblingSourceId || selectedProject || heading ? (
             <h1 className="min-w-0 break-words text-center text-[24px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {siblingSourceId ? "Add an agent" : selectedProject || heading}
+              {siblingSourceId ? "Add nested agent" : selectedProject || heading}
             </h1>
           ) : null}
           {siblingSourceId && (

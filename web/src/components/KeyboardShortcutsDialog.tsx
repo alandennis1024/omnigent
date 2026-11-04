@@ -173,7 +173,7 @@ function shortcutGroupsFor(
         items: [
           { label: "Start a new session", keys: newSessionShortcutKeys(native) },
           ...(siblingSessions
-            ? [{ label: "Add an agent to this session", keys: [MOD_KEY, ALT_KEY, "A"] }]
+            ? [{ label: "Add nested agent", keys: [MOD_KEY, ALT_KEY, "A"] }]
             : []),
           ...group.items,
         ],

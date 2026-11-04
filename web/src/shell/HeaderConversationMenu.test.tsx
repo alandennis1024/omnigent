@@ -197,7 +197,7 @@ describe("HeaderConversationMenu", () => {
       "Fork",
       "Export",
       "Rename",
-      "Add Agent",
+      "Add nested agent",
       "Mark as unread",
       "Add to project",
       "Archive",
@@ -216,7 +216,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
   });
 
-  it("opens Add Agent with Ctrl+Alt+A and ignores held, composing, and AltGraph keys", () => {
+  it("opens Add nested agent with Ctrl+Alt+A and ignores held, composing, and AltGraph keys", () => {
     renderMenu();
     const addAgentKey = (init: KeyboardEventInit = {}) =>
       new KeyboardEvent("keydown", {
@@ -366,7 +366,7 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "Add Agent" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
     const item = screen.getByRole("menuitem", { name: "Unarchive" });
     expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
 
@@ -587,7 +587,7 @@ describe("HeaderConversationMenu", () => {
       "Fork",
       "Export",
       "Rename",
-      "Add Agent",
+      "Add nested agent",
       "Mark as unread",
       "Add to project",
       "Archive",
@@ -610,7 +610,7 @@ describe("HeaderConversationMenu", () => {
       "Fork",
       "Export",
       "Rename",
-      "Add Agent",
+      "Add nested agent",
       "Mark as unread",
       "Add to project",
       "Files",
