@@ -31,7 +31,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(autouse=True)
-def orchestration_environment(monkeypatch, request):
+def orchestration_environment(monkeypatch, request, tmp_path):
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     features = getattr(request, "param", None)
     if features is None:
         monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
