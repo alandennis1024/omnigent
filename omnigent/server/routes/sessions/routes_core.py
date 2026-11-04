@@ -3883,8 +3883,9 @@ def register_core_routes(
             created fork (status ``"idle"``).
         :raises OmnigentError: 404 if *source_id* does not exist or
             ``body.agent_id`` names no agent; 403/404 if the caller
-            lacks read access on the source, or on the session that
-            owns a session-scoped ``body.agent_id``; 400 if the source
+            lacks read access on the source (owner access for a side
+            chat), or on the session that owns a session-scoped
+            ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
             for a sandbox this server has not configured; 409 if
@@ -3893,8 +3894,13 @@ def register_core_routes(
             its source missing.
         """
         user_id = _get_user_id(request, auth_provider)
+        # Only a session's owner can start its side chats.
         access = await _require_access_and_level(
-            user_id, source_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            source_id,
+            LEVEL_OWNER if body.side_chat else LEVEL_READ,
+            permission_store,
+            conversation_store,
         )
         source = access.conversation
         if source is None:
