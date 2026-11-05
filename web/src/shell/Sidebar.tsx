@@ -106,7 +106,7 @@ import {
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
-import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import {
   Link,
   useLocation,
@@ -875,7 +875,8 @@ function SidebarImpl({
   // while the query is still loading (`pinnedData` undefined).
   const pinnedFamilyRows = pinnedData?.conversations ?? EMPTY_CONVERSATIONS;
   const pinnedConversations = useMemo(
-    () => pinnedFamilyRows.filter(isPinOrderUnit),
+    () =>
+      pinnedFamilyRows.filter((row) => isPinOrderUnit(row) || row.labels[PINNED_LABEL_KEY] != null),
     [pinnedFamilyRows],
   );
   const pinnedFilterHonored = pinnedData?.filterHonored ?? false;
@@ -1989,7 +1990,7 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
-  const groupOrder = useMemo(
+  const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"
         ? [...new Set(allConversations.map(harnessLabel))].sort((a, b) => a.localeCompare(b))
@@ -2257,7 +2258,14 @@ function ConversationList({
           ? representative.id
           : row.id,
       );
-      if (group && !familyGroups.has(row.family.id)) familyGroups.set(row.family.id, group);
+      const previous = familyGroups.get(row.family.id);
+      if (
+        group &&
+        (!previous ||
+          (view.grouping === "status" && groupOrder.indexOf(group) < groupOrder.indexOf(previous)))
+      ) {
+        familyGroups.set(row.family.id, group);
+      }
     }
     for (const row of ordered) {
       const group = row.family ? familyGroups.get(row.family.id) : undefined;
@@ -4042,6 +4050,7 @@ function ConversationSection({
   const visibleFamilyRows = conversations.filter(
     (row) => !isNestedFamilyRow(row) || !collapsedFamilies.has(row.family!.id),
   );
+  const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
@@ -4154,7 +4163,7 @@ function ConversationSection({
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {visibleFamilyRows.map((conv, index) => (
+              {visibleFamilyRows.map((conv) => (
                 <ConversationRow
                   key={conv.id}
                   conversation={conv}
@@ -4187,10 +4196,10 @@ function ConversationSection({
                   isSelected={selectedIds.has(conv.id)}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
-                  reorderGroup={reorderGroup}
-                  previousId={reorderNeighbour(visibleFamilyRows[index - 1])}
-                  nextId={reorderNeighbour(visibleFamilyRows[index + 1])}
-                  reorderIndex={reorderGroup ? index : undefined}
+                  reorderGroup={isNestedFamilyRow(conv) ? undefined : reorderGroup}
+                  previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
+                  nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
+                  reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
                 />
               ))}
             </ul>
