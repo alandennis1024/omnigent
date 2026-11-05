@@ -87,7 +87,9 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
             return httpx.Response(200, json=info)
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
-        return httpx.Response(201, json={"id": session_id, "agent_id": "worker"})
+        return httpx.Response(
+            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
@@ -141,7 +143,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert "parent_session_id" not in body
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
         assert result["kind"] == "default"
-        assert "family" in result
+        assert result["family"] == {"id": "manager"}
         assert result["agent_id"] == "worker"
         assert result["title"] == "Worker task"
         register.assert_not_called()
