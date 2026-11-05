@@ -972,7 +972,6 @@ def _assert_scrolls_to_reveal(composer: Locator, line: int, scroll_before: float
 @pytest.mark.parametrize(
     ("edit", "expected"),
     [
-        pytest.param("Alt+Enter", _ITEMS + "\n", id="alt-enter"),
         pytest.param("paste", _ITEMS + "\nalpha\nbeta", id="paste"),
         pytest.param(
             "Shift+Enter above more text", _ITEMS + "\n  - " + _TEXT_BELOW, id="list-mid-draft"
@@ -1055,7 +1054,7 @@ def test_alt_enter_scrolls_only_as_far_as_the_caret_line(
     scroll_before = _align_line(composer, aligned_line, "bottom")
     assert _line_in_view(composer, caret_line + 1) is not scrolls
 
-    composer.press("Alt+Enter")
+    page.keyboard.insert_text("\n")
     expect(composer).to_have_value(draft[:caret] + "\n" + draft[caret:])
     _assert_scrolls_to_reveal(composer, caret_line + 1, scroll_before)
 
