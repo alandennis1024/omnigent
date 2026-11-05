@@ -5164,7 +5164,7 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
-  const showSharedIndicator = !isOwner;
+  const showSharedIndicator = !isOwner || conversation.shared_with_others === true;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
@@ -5687,7 +5687,7 @@ function ConversationRowImpl({
         <span
           role="img"
           aria-label="Shared session"
-          title="Shared with you"
+          title={isOwner ? "Shared with others" : "Shared with you"}
           className={cn(
             "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
             overlayTop,
@@ -6049,6 +6049,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "background_work_running",
   "blocked_on",
   "provisional",
+  "shared_with_others",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {

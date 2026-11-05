@@ -469,6 +469,67 @@ describe("Sidebar session list", () => {
     }
   });
 
+  it("marks the viewer's own sessions only when the server says they're shared", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_shared", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+        }),
+        conv("owned_private", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: false,
+        }),
+        // Older servers omit the field; an owned row then shows no icon.
+        conv("owned_legacy", "Claude Code", { owner: "viewer@example.com" }),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("owned_shared").closest("li")!;
+      expect(within(sharedRow).getByRole("img", { name: "Shared session" })).toHaveAttribute(
+        "title",
+        "Shared with others",
+      );
+      const privateRow = screen.getByText("owned_private").closest("li")!;
+      expect(within(privateRow).queryByRole("img", { name: "Shared session" })).toBeNull();
+      const legacyRow = screen.getByText("owned_legacy").closest("li")!;
+      expect(within(legacyRow).queryByRole("img", { name: "Shared session" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("re-renders a rendered row when its shared flag flips", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      const row = (shared: boolean) =>
+        conv("owned", "Claude Code", { owner: "viewer@example.com", shared_with_others: shared });
+      mockConversations([row(false)]);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/"]}>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+
+      mockConversations([row(true)]);
+      rerender(tree());
+      expect(screen.getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
   it("keeps the shared indicator on pinned sessions across filters", () => {
     mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
     seedPins(["shared_pin"]);
