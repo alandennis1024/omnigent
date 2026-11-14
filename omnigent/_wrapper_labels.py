@@ -97,3 +97,6 @@ COMMANDCODE_NATIVE_WRAPPER_VALUE = "commandcode-native-ui"
 # Value the ``omnigent grok`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 GROK_NATIVE_WRAPPER_VALUE = "grok-native-ui"
+# Value the ``omnigent cline`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+CLINE_NATIVE_WRAPPER_VALUE = "cline-native-ui"

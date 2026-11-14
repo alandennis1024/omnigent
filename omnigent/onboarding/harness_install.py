@@ -468,6 +468,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     COMMANDCODE_KEY: COMMANDCODE_KEY,
     "commandcode-native": COMMANDCODE_KEY,
     "native-commandcode": COMMANDCODE_KEY,
+    # Native Cline (``cline-native``) wraps the ``cline`` CLI; the bare
+    # ``cline`` spelling is the ACP row and ``native-cline`` the reversed
+    # spelling — all gate on the same binary.
+    "cline": "cline",
+    "cline-native": "cline",
+    "native-cline": "cline",
 }
 
 

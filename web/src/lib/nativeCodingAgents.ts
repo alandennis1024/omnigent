@@ -76,7 +76,8 @@ export type NativeCodingAgentIconKind =
   | "kimi"
   | "hermes"
   | "devin"
-  | "commandcode";
+  | "commandcode"
+  | "cline";
 export type NativeCodingAgentCapability =
   | "permissionMode"
   | "approvalMode"
@@ -299,6 +300,19 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "grok",
     sortRank: 75,
   },
+  {
+    // cline has no brand glyph yet, so it falls back to the generic bot icon
+    // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "cline"`
+    // intentionally matches no icon branch. Auth/approval surface in the
+    // embedded terminal, so no capability flags are declared here.
+    key: "cline",
+    agentName: "cline-native-ui",
+    harness: "cline-native",
+    wrapperLabel: "cline-native-ui",
+    displayName: "Cline",
+    iconKind: "cline",
+    sortRank: 85,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
@@ -334,6 +348,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",
+  "native-cline": "cline-native",
   "native-opencode": "opencode-native",
   "native-commandcode": "commandcode-native",
 };
