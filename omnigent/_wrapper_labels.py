@@ -94,3 +94,6 @@ HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
 # Value the ``omnigent commandcode`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 COMMANDCODE_NATIVE_WRAPPER_VALUE = "commandcode-native-ui"
+# Value the ``omnigent grok`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+GROK_NATIVE_WRAPPER_VALUE = "grok-native-ui"

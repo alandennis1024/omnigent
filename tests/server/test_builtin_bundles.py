@@ -255,6 +255,8 @@ _EXPECTED_BUILTIN_AGENT_IDS = {
     "devin-native-ui": "010b5eea4b105dc0af6fb62f46065894",
     # Added with the commandcode-native harness — likewise an addition.
     "commandcode-native-ui": "c474a17d2f55a2b55cd89c790a7c75b9",
+    # Added with the grok-native harness — new row, no drift above.
+    "grok-native-ui": "133499537450decf0a3fc425c686a02f",
 }
 
 

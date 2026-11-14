@@ -270,6 +270,16 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     Its coverage is the dedicated commandcode-native bridge/forwarder unit
     tests.
 
+    ``grok-native`` is excluded for the union of both reasons, like
+    ``devin-native``: it is a terminal-first ``native-server`` harness launched
+    via ``omni grok`` (runner-owned ``grok agent serve`` WebSocket endpoint +
+    bridge dir), not ``omnigent run --harness grok-native``, AND it wraps the
+    own-auth ``grok`` CLI (``grok login`` / ``XAI_API_KEY``), so its spawn env
+    carries no gateway/profile probe vars for this matrix to drive. Its
+    coverage is the dedicated grok_native unit tests (serve/client/items/
+    hooks/bridge/credentials) plus this repo's harness-bench native-server
+    surface once registered there.
+
     Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
     for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
     spawn env carries no gateway/profile probe vars for this matrix to drive.
@@ -291,6 +301,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "qwen-native",
         "goose",
         "goose-native",
+        "grok-native",
         "kiro-native",
         "kimi",
         "kimi-native",

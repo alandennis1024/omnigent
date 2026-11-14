@@ -127,6 +127,7 @@ def register_resource_routes(
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_session_registered: Callable[[str], Coroutine[Any, Any, None]],
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _grok_terminal_ensure_locks: dict[str, asyncio.Lock],
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock],
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock],
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock],
@@ -393,6 +394,7 @@ def register_resource_routes(
                     "kimi": _kimi_terminal_ensure_locks,
                     "devin": _devin_terminal_ensure_locks,
                     "commandcode": _commandcode_terminal_ensure_locks,
+                    "grok": _grok_terminal_ensure_locks,
                 }
             )[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
