@@ -908,3 +908,180 @@ def test_streamed_400_overflow_classified_as_context_window_exceeded(
     assert err.actual_tokens == 210141
     assert err.detail is not None
     assert "prompt is too long" in (err.detail.response_body or "")
+
+
+# ── connection_params headers + CI gateway tags ──────────
+
+
+def _capture_requests(monkeypatch, response_body: bytes) -> list[httpx.Request]:
+    requests = []
+    real_client = httpx.AsyncClient
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, content=response_body)
+
+    def client(**kwargs):
+        return real_client(transport=httpx.MockTransport(respond), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    return requests
+
+
+def _ok_body(stream: bool) -> bytes:
+    if stream:
+        return (
+            b'data: {"type": "message_start", "message": {"id": "msg_1",'
+            b' "model": "claude-test", "usage": {"input_tokens": 10}}}\n\n'
+            b'data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"},'
+            b' "usage": {"output_tokens": 5}}\n\n'
+        )
+    return json.dumps(
+        {
+            "id": "msg_1",
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "OK"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+    ).encode()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("scenario", ["gateway", "external", "default", "disabled", "malformed"])
+def test_chat_request_adds_only_opted_in_gateway_metadata(monkeypatch, stream, scenario):
+    """Parity with the OpenAI adapter: extra_headers merge and CI gateway tags."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.llms.adapters.anthropic import AnthropicAdapter
+
+    gateway = "https://accounts.cloud.databricks.com/ai-gateway/anthropic"
+    external = "https://provider.example/v1"
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    adapter = AnthropicAdapter()
+    connection = {
+        "api_key": "test-api-key",
+        "extra_headers": {"X-Caller": "policy"},
+    }
+    if scenario == "gateway":
+        connection["base_url"] = gateway + "/"
+    elif scenario == "external":
+        connection["base_url"] = external + "/"
+    requests = _capture_requests(monkeypatch, _ok_body(stream))
+
+    async def send():
+        result = await adapter.chat_completions(
+            messages=[{"role": "user", "content": "Hi"}],
+            model="claude-test",
+            tools=None,
+            stream=stream,
+            extra={"max_tokens": 17},
+            connection_params=connection,
+            timeout=9,
+        )
+        if stream:
+            async for _ in result:
+                pass
+
+    asyncio.run(send())
+    tags = {"pipeline": "flake-stress-e2e", "run_id": "123"}
+    if scenario == "malformed":
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", "not-json")
+    elif scenario != "disabled":
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", json.dumps(tags))
+    asyncio.run(send())
+
+    assert len(requests) == 2
+    baseline, attributed = requests
+    target = {"gateway": gateway, "external": external}.get(
+        scenario, "https://api.anthropic.com/v1"
+    )
+    assert str(attributed.url) == target + "/messages"
+    assert attributed.method == baseline.method == "POST"
+    assert attributed.content == baseline.content
+    headers = dict(attributed.headers)
+    actual_tags = headers.pop(REQUEST_TAGS_HEADER.lower(), None)
+    assert headers == dict(baseline.headers)
+    assert headers["x-api-key"] == "test-api-key"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert headers["x-caller"] == "policy"
+    if scenario == "gateway":
+        assert json.loads(actual_tags) == tags
+    else:
+        assert actual_tags is None
+
+
+@pytest.mark.parametrize("existing_tags", ['{"team":"platform"}', "not-json", "[]"])
+def test_chat_request_preserves_existing_tag_headers(monkeypatch, existing_tags):
+    """Parity with the OpenAI adapter: CI tags merge into caller tag headers."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.llms.adapters.anthropic import AnthropicAdapter
+
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"flake-stress-e2e"}')
+    extra_headers = {REQUEST_TAGS_HEADER.lower(): existing_tags, "X-Caller": "policy"}
+    requests = _capture_requests(monkeypatch, _ok_body(stream=False))
+    adapter = AnthropicAdapter()
+    asyncio.run(
+        adapter.chat_completions(
+            messages=[{"role": "user", "content": "Hi"}],
+            model="claude-test",
+            tools=None,
+            stream=False,
+            extra={"max_tokens": 17},
+            connection_params={
+                "api_key": "test-api-key",
+                "base_url": "https://accounts.cloud.databricks.com/ai-gateway/anthropic",
+                "extra_headers": extra_headers,
+            },
+        )
+    )
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.headers["x-api-key"] == "test-api-key"
+    assert request.headers["X-Caller"] == "policy"
+    values = request.headers.get_list(REQUEST_TAGS_HEADER)
+    assert len(values) == 1
+    if existing_tags.startswith("{"):
+        assert json.loads(values[0]) == {"team": "platform", "pipeline": "flake-stress-e2e"}
+    else:
+        assert values == [existing_tags]
+    assert extra_headers == {REQUEST_TAGS_HEADER.lower(): existing_tags, "X-Caller": "policy"}
+
+
+# ── Upstream error body logging ──────────────────────────
+
+
+def test_send_request_logs_upstream_error_body(serve_streamed_response, caplog) -> None:
+    """A non-streaming 4xx logs the provider's error body before raising."""
+    from omnigent.llms.adapters.anthropic import _send_request
+
+    serve_streamed_response(400, b'{"error": {"message": "bad request detail"}}')
+    with caplog.at_level(logging.ERROR, logger="omnigent.llms.adapters.anthropic"):
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(
+                _send_request(
+                    headers={},
+                    payload={"model": "claude-test"},
+                    base_url="https://fake-host/v1",
+                )
+            )
+    assert "bad request detail" in caplog.text
+
+
+def test_stream_request_logs_upstream_error_body(serve_streamed_response, caplog) -> None:
+    """A streamed 4xx logs the buffered error body before raising."""
+    serve_streamed_response(429, b'{"error": {"message": "rate limited upstream"}}')
+
+    async def _run() -> None:
+        gen = _stream_request(
+            headers={},
+            payload={"model": "claude-test", "stream": True},
+            base_url="https://fake-host/v1",
+        )
+        async for _ in gen:
+            pass
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.llms.adapters.anthropic"):
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(_run())
+    assert "rate limited upstream" in caplog.text
