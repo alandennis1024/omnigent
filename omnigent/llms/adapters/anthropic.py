@@ -23,6 +23,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from cachetools import TTLCache
 
+from omnigent.databricks_ai_gateway import gateway_request_tag_headers, with_ci_request_tags
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
@@ -78,7 +79,7 @@ class AnthropicAdapter(BaseAdapter):
         :param stream: Enable streaming.
         :param extra: Additional kwargs (temperature, etc.).
         :param connection_params: Per-call overrides. Supported keys:
-            ``"api_key"``, ``"base_url"``.
+            ``"api_key"``, ``"base_url"``, ``"extra_headers"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :returns: Chat Completions response dict or async chunk
@@ -90,6 +91,20 @@ class AnthropicAdapter(BaseAdapter):
         )
         override_base = params.get("base_url")
         effective_base = override_base.rstrip("/") if override_base else _BASE_URL
+        # Databricks-local divergence (see third_party/sync): merge caller-supplied
+        # headers threaded through connection_params so gateway routes needing
+        # proxy auth or a `host` header can set them per call.
+        extra_headers: object = params.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            headers.update(
+                {
+                    key: value
+                    for key, value in extra_headers.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+            )
+        if gateway_request_tag_headers(effective_base):
+            headers = with_ci_request_tags(headers)
         model_metadata = None
         if extra.get("reasoning_effort"):
             model_metadata = await _get_anthropic_model_metadata(headers, effective_base, model)
@@ -768,6 +783,13 @@ async def _send_request(
             headers=headers,
             json=payload,
         )
+        # Databricks-local divergence (see third_party/sync): surface the
+        # upstream error body, which raise_for_status() omits — essential for
+        # debugging 4xx from the serving/gateway route.
+        if resp.status_code >= 400:
+            _logger.error(
+                "LLM request to %s failed %d: %s", url, resp.status_code, resp.text[:2000]
+            )
         resp.raise_for_status()
         return _anthropic_to_chat(resp.json())
 
@@ -805,6 +827,11 @@ async def _stream_request(
         # never see the provider's message.
         if resp.status_code >= 400:
             await resp.aread()
+            # Databricks-local divergence (see third_party/sync): log the
+            # upstream error body for serving/gateway 4xx debugging.
+            _logger.error(
+                "LLM stream to %s failed %d: %s", url, resp.status_code, resp.text[:2000]
+            )
         resp.raise_for_status()
         async for chunk in _stream_to_chat_chunks(
             resp.aiter_lines(),
