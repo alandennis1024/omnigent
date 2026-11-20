@@ -1737,13 +1737,14 @@ describe("chatStore — switchTo", () => {
   // or the host-restart "bubble disappears" fix mis-fires.
   // ``isNativeTerminalSession`` gates the optimistic-bubble clear; the companion
   // ``nativeVendorOwnsModel`` hides the composer model/effort chip for native
-  // wrappers whose model is chosen inside the vendor TUI (qwen/goose/pi/cursor/
-  // opencode) — claude/codex keep it (they expose an Omnigent model picker).
+  // wrappers whose model is chosen inside the vendor TUI (goose/pi/cursor/
+  // opencode) — claude/codex/qwen keep it (claude/codex expose an Omnigent
+  // model picker; qwen's forwarder mirrors the live TUI model onto the session).
   it.each([
     ["claude-code-native-ui", true, false],
     ["codex-native-ui", true, false],
     ["pi-native-ui", true, true],
-    ["qwen-native-ui", true, true],
+    ["qwen-native-ui", true, false],
     ["goose-native-ui", true, true],
     ["some-other-wrapper", false, false],
     [null, false, false],

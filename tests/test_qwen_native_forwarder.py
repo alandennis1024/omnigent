@@ -9,6 +9,7 @@ The event shapes cover qwen v0.18.1 and v0.21.14 (see
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 
@@ -144,7 +145,7 @@ def test_could_not_load_marker_stripped() -> None:
 def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(_ev_bytes(_user_ev("u1", "q")))
-    items, off, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
+    items, off, _, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u1"]
     assert off == f.stat().st_size
 
@@ -155,7 +156,7 @@ def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
         complete_size = f.stat().st_size
         fh.write(b'{"type":"assistant","uuid":"a2"')  # no newline yet
         fh.flush()
-    items, off2, _, _ = _read_new_forward_events(f, off, {"u1"}, _AGENT, "")
+    items, off2, _, _, _ = _read_new_forward_events(f, off, {"u1"}, _AGENT, "")
     assert [i.uuid for i in items] == ["a1"]
     # Offset stops at the last newline — the partial line is not consumed.
     assert off2 == complete_size
@@ -165,20 +166,20 @@ def test_read_new_events_detects_truncation(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     # A long first line so the stale offset exceeds the post-truncation size.
     f.write_bytes(_ev_bytes(_user_ev("u1", "first message, intentionally long " * 4)))
-    _, off, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
+    _, off, _, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert off > 0
     # A relaunched terminal truncates + writes a shorter line; size < offset
     # must rewind so the fresh content is not skipped.
     f.write_bytes(_ev_bytes(_user_ev("u2", "fresh")))
     assert f.stat().st_size < off
-    items, _, _, _ = _read_new_forward_events(f, off, set(), _AGENT, "")
+    items, _, _, _, _ = _read_new_forward_events(f, off, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u2"]
 
 
 def test_malformed_line_tolerated(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(b"not json\n" + _ev_bytes(_user_ev("u1", "ok")))
-    items, _, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
+    items, _, _, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u1"]
 
 
@@ -198,7 +199,7 @@ def test_forward_events_preserve_item_then_terminal_output_order(tmp_path: Path)
         )
     )
 
-    actions, offset, buffered, stop_reason = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    actions, offset, buffered, stop_reason, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
 
     assert [type(action) for action in actions] == [
         fwd._MirrorItem,
@@ -230,7 +231,7 @@ def test_forward_events_terminal_without_pty_idle_and_failure(tmp_path: Path) ->
         )
     )
 
-    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    actions, _, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
 
     terminal = actions[-1]
     assert isinstance(terminal, fwd._TerminalStatus)
@@ -246,7 +247,7 @@ def test_qwen_021_message_stop_completes_final_text_turn(tmp_path: Path) -> None
         + _ev_bytes(_message_stop_ev("stop-1"))
     )
 
-    actions, _, buffered, stop_reason = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    actions, _, buffered, stop_reason, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
 
     assert [type(action) for action in actions] == [
         fwd._MirrorItem,
@@ -287,7 +288,7 @@ def test_qwen_021_message_stop_skips_tool_use_and_completes_final_turn(tmp_path:
         + _ev_bytes(_message_stop_ev("stop-final"))
     )
 
-    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    actions, _, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
     terminals = [action for action in actions if isinstance(action, fwd._TerminalStatus)]
 
     assert [terminal.uuid for terminal in terminals] == ["stop-final"]
@@ -299,7 +300,7 @@ def test_qwen_021_message_stop_context_survives_poll_boundary(tmp_path: Path) ->
     events = tmp_path / "out.ndjson"
     events.write_bytes(_ev_bytes(_asst_ev("a1", [{"type": "text", "text": "answer"}])))
 
-    first, offset, buffered, stop_reason = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    first, offset, buffered, stop_reason, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
     assert [action.uuid for action in first] == ["a1"]
     assert buffered == "answer"
     assert stop_reason == ""
@@ -307,7 +308,7 @@ def test_qwen_021_message_stop_context_survives_poll_boundary(tmp_path: Path) ->
     with open(events, "ab") as fh:
         fh.write(_ev_bytes(_message_stop_ev("stop-1")))
 
-    second, _, buffered, stop_reason = _read_new_forward_events(
+    second, _, buffered, stop_reason, _ = _read_new_forward_events(
         events,
         offset,
         {"a1"},
@@ -341,7 +342,7 @@ def test_qwen_021_truncation_resets_persisted_assistant_context(tmp_path: Path) 
     )
     assert events.stat().st_size < persisted.offset
 
-    actions, _, buffered, stop_reason = _read_new_forward_events(
+    actions, _, buffered, stop_reason, _ = _read_new_forward_events(
         events,
         persisted.offset,
         set(persisted.seen_uuids or []),
@@ -385,10 +386,10 @@ def test_forward_events_dedup_and_genuinely_empty_result(tmp_path: Path) -> None
     }
     events.write_bytes(_ev_bytes(result) + _ev_bytes(result))
 
-    actions, _, _, _ = _read_new_forward_events(events, 0, {"r-empty"}, _AGENT, "")
+    actions, _, _, _, _ = _read_new_forward_events(events, 0, {"r-empty"}, _AGENT, "")
     assert actions == []
 
-    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    actions, _, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
     terminals = [action for action in actions if isinstance(action, fwd._TerminalStatus)]
     assert len(terminals) == 1
     assert all(terminal.output is None for terminal in terminals)
@@ -772,7 +773,7 @@ async def test_partial_batch_failure_retries_only_terminal_with_buffered_output(
 
     monkeypatch.setattr(fwd, "_post_conversation_item", _post_item)
     monkeypatch.setattr(fwd, "_post_external_session_status", _post_terminal)
-    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    actions, _, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
 
     with pytest.raises(httpx.ConnectError, match="terminal unavailable"):
         await fwd._deliver_forward_actions(  # type: ignore[arg-type]
@@ -783,7 +784,7 @@ async def test_partial_batch_failure_retries_only_terminal_with_buffered_output(
     assert persisted.offset == 0
     assert persisted.seen_uuids == ["a1"]
     assert persisted.last_assistant_text == "durable answer"
-    retry_actions, retry_offset, _, _ = _read_new_forward_events(
+    retry_actions, retry_offset, _, _, _ = _read_new_forward_events(
         events,
         persisted.offset,
         set(persisted.seen_uuids or []),
@@ -920,3 +921,282 @@ async def test_supervise_restarts_then_propagates_cancel(
 
     assert calls["n"] == 2
     assert sleeps == [1.0]  # initial backoff before the one restart
+
+
+# --- live model + token usage mirror (model chip / context ring / cost) ------
+
+
+def _asst_usage_ev(uuid: str, text: str, usage: dict, model: str | None = None) -> dict:
+    message: dict = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "usage": usage,
+    }
+    if model is not None:
+        message["model"] = model
+    return {"type": "assistant", "uuid": uuid, "message": message}
+
+
+def test_usage_and_model_from_assistant_event_splits_cache_from_input() -> None:
+    usage, model = fwd._usage_and_model_from_event(
+        _asst_usage_ev(
+            "a1",
+            "x",
+            {
+                "input_tokens": 1000,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 700,
+                "total_tokens": 1050,
+            },
+            "openai/gpt-oss-120b:free",
+        )
+    )
+    assert usage == {
+        "input_tokens": 300,  # cache-inclusive 1000 minus 700 cache-read
+        "output_tokens": 50,
+        "cache_read_input_tokens": 700,
+        "total_tokens": 1050,
+    }
+    assert model == "openai/gpt-oss-120b:free"
+
+
+def test_usage_and_model_from_event_tolerates_missing_and_junk() -> None:
+    # Plain assistant message: no usage, no model.
+    assert fwd._usage_and_model_from_event(_asst_ev("a1", [{"type": "text", "text": "hi"}])) == (None, None)
+    # Malformed usage block and non-string model are ignored, not fatal.
+    ev = _asst_usage_ev("a2", "x", {"input_tokens": "nope", "cache_read_input_tokens": None}, model=42)  # type: ignore[dict-item]
+    usage, model = fwd._usage_and_model_from_event(ev)
+    assert usage == {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "total_tokens": 0}
+    assert model is None
+    # User events carry neither.
+    assert fwd._usage_and_model_from_event(_user_ev("u1", "hi")) == (None, None)
+
+
+def test_model_from_system_session_start_accepts_wrapped_payload() -> None:
+    _, model = fwd._usage_and_model_from_event(
+        {"type": "system", "subtype": "session_start", "data": {"model": "qwen3-coder-plus"}}
+    )
+    assert model == "qwen3-coder-plus"
+    _, model = fwd._usage_and_model_from_event(
+        {"type": "system", "subtype": "session_start", "data": {"models": ["qwen-plus", "qwen-max"]}}
+    )
+    assert model == "qwen-plus"
+    # Pre-v0.18 shape: payload at the top level.
+    _, model = fwd._usage_and_model_from_event({"type": "system", "subtype": "init", "model": "qwen-turbo"})
+    assert model == "qwen-turbo"
+
+
+def test_context_window_for_curated_lookup_and_fallback() -> None:
+    assert fwd._context_window_for("openai/gpt-oss-120b:free") == 131_072
+    assert fwd._context_window_for("qwen3-coder-plus") == 1_000_000
+    assert fwd._context_window_for("qwen3-coder-flash-latest") == 1_000_000
+    assert fwd._context_window_for("qwen-max") == 131_072
+    # Unknown models fall back so the ring still renders.
+    assert fwd._context_window_for("some-future-model") == fwd._QWEN_DEFAULT_CONTEXT_WINDOW
+    assert fwd._context_window_for(None) == fwd._QWEN_DEFAULT_CONTEXT_WINDOW
+
+
+def test_read_new_events_collects_usage_model_observations(tmp_path: Path) -> None:
+    """Observations aggregate independently of the mirror-item dedup."""
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes({"type": "system", "subtype": "session_start", "data": {"model": "qwen-plus"}})
+        + _ev_bytes(_user_ev("u1", "question"))
+        # Tool-only assistant turn: no mirror item, but it bills tokens.
+        + _ev_bytes(
+            _asst_usage_ev(
+                "a-tool",
+                "",
+                {"input_tokens": 900, "output_tokens": 10, "cache_read_input_tokens": 800, "total_tokens": 910},
+                "qwen-plus",
+            )
+        )
+        + _ev_bytes(
+            _asst_usage_ev(
+                "a1",
+                "final answer",
+                {"input_tokens": 1000, "output_tokens": 50, "cache_read_input_tokens": 700, "total_tokens": 1050},
+                "qwen-plus",
+            )
+        )
+    )
+    actions, _, _, _, observations = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    # The empty-text tool turn produces no item; the user + final answer do.
+    assert [a.uuid for a in actions] == ["u1", "a1"]
+    assert observations == [
+        (None, "qwen-plus"),
+        (
+            {"input_tokens": 100, "output_tokens": 10, "cache_read_input_tokens": 800, "total_tokens": 910},
+            "qwen-plus",
+        ),
+        (
+            {"input_tokens": 300, "output_tokens": 50, "cache_read_input_tokens": 700, "total_tokens": 1050},
+            "qwen-plus",
+        ),
+    ]
+
+
+async def test_report_usage_and_model_posts_cumulative_snapshot_and_dedupes() -> None:
+    client = _RecordingClient()
+    state = _ForwardState()
+    usage = {"input_tokens": 300, "output_tokens": 50, "cache_read_input_tokens": 700, "total_tokens": 1050}
+
+    await fwd._report_usage_and_model(  # type: ignore[arg-type]
+        client, session_id="conv", state=state, observations=[(usage, "qwen-plus")]
+    )
+    assert state.usage_input_tokens == 300
+    assert state.usage_output_tokens == 50
+    assert state.usage_cache_read_tokens == 700
+    assert state.last_context_tokens == 1050
+    assert state.posted_model == "qwen-plus"
+    usage_posts = [body for _, body in client.posts if body["type"] == "external_session_usage"]
+    model_posts = [body for _, body in client.posts if body["type"] == "external_model_change"]
+    assert len(usage_posts) == 1
+    assert usage_posts[0]["data"] == {
+        "cumulative_input_tokens": 300,
+        "cumulative_output_tokens": 50,
+        "cumulative_cache_read_input_tokens": 700,
+        "context_tokens": 1050,
+        "context_window": 131_072,
+        "model": "qwen-plus",
+    }
+    assert model_posts == [{"type": "external_model_change", "data": {"model": "qwen-plus"}}]
+
+    # Same batch again (poll retry): unchanged snapshot → no repost, no double count.
+    await fwd._report_usage_and_model(  # type: ignore[arg-type]
+        client, session_id="conv", state=state, observations=[]
+    )
+    assert [body for _, body in client.posts if body["type"] == "external_session_usage"] == usage_posts
+
+    # A new turn grows the cumulative; the window follows a model switch.
+    await fwd._report_usage_and_model(  # type: ignore[arg-type]
+        client,
+        session_id="conv",
+        state=state,
+        observations=[({"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 0, "total_tokens": 120}, "qwen3-coder-plus")],
+    )
+    assert state.usage_input_tokens == 400
+    assert state.last_context_tokens == 120
+    usage_posts = [body for _, body in client.posts if body["type"] == "external_session_usage"]
+    assert len(usage_posts) == 2
+    assert usage_posts[1]["data"]["cumulative_input_tokens"] == 400
+    assert usage_posts[1]["data"]["context_window"] == 1_000_000
+    model_posts = [body for _, body in client.posts if body["type"] == "external_model_change"]
+    assert [p["data"]["model"] for p in model_posts] == ["qwen-plus", "qwen3-coder-plus"]
+
+
+async def test_report_usage_and_model_retries_failed_post_without_double_count() -> None:
+    responses: list[httpx.Response] = [
+        httpx.Response(500, request=httpx.Request("POST", "http://test/v1/sessions/conv/events")),
+        httpx.Response(200, request=httpx.Request("POST", "http://test/v1/sessions/conv/events")),
+        httpx.Response(200, request=httpx.Request("POST", "http://test/v1/sessions/conv/events")),
+    ]
+    posts: list[dict] = []
+
+    class _FlakyClient:
+        async def post(self, url: str, *, json: dict) -> httpx.Response:
+            posts.append(json)
+            return responses.pop(0)
+
+    state = _ForwardState()
+    usage = {"input_tokens": 300, "output_tokens": 50, "cache_read_input_tokens": 700, "total_tokens": 1050}
+    await fwd._report_usage_and_model(  # type: ignore[arg-type]
+        _FlakyClient(), session_id="conv", state=state, observations=[(usage, "qwen-plus")]
+    )
+    # The failed usage post left the snapshot unposted; counters are committed
+    # once. The model change is an independent post and succeeded.
+    assert state.posted_usage is None
+    assert state.usage_input_tokens == 300
+    assert state.posted_model == "qwen-plus"
+
+    await fwd._report_usage_and_model(  # type: ignore[arg-type]
+        _FlakyClient(), session_id="conv", state=state, observations=[]
+    )
+    # Retry re-posts the SAME cumulative usage snapshot (SET semantics — the
+    # server attributes zero growth on the repeat, so no double-counted cost).
+    usage_posts = [body for body in posts if body["type"] == "external_session_usage"]
+    assert len(usage_posts) == 2
+    assert usage_posts[0]["data"]["cumulative_input_tokens"] == 300
+    assert usage_posts[1]["data"]["cumulative_input_tokens"] == 300
+    assert state.posted_usage is not None
+    assert state.posted_model == "qwen-plus"
+
+
+def test_forward_state_roundtrips_usage_model_fields(tmp_path: Path) -> None:
+    state = _ForwardState(offset=7, seen_uuids=["a"])
+    state.usage_input_tokens = 300
+    state.usage_output_tokens = 50
+    state.usage_cache_read_tokens = 700
+    state.last_context_tokens = 1050
+    state.observed_model = "qwen-plus"
+    state.posted_model = "qwen-plus"
+    state.posted_usage = {"cumulative_input_tokens": 300, "context_window": 131_072}
+    assert _write_state(tmp_path, state) is True
+    loaded = _read_state(tmp_path)
+    assert loaded.usage_input_tokens == 300
+    assert loaded.usage_output_tokens == 50
+    assert loaded.usage_cache_read_tokens == 700
+    assert loaded.last_context_tokens == 1050
+    assert loaded.observed_model == "qwen-plus"
+    assert loaded.posted_model == "qwen-plus"
+    assert loaded.posted_usage == {"cumulative_input_tokens": 300, "context_window": 131_072}
+
+
+async def test_forward_loop_posts_usage_model_alongside_items(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        _ev_bytes({"type": "system", "subtype": "session_start", "data": {"model": "qwen-plus"}})
+        + _ev_bytes(_user_ev("u1", "hello"))
+        + _ev_bytes(
+            _asst_usage_ev(
+                "a1",
+                "hi there",
+                {"input_tokens": 1000, "output_tokens": 50, "cache_read_input_tokens": 700, "total_tokens": 1050},
+                "qwen-plus",
+            )
+        )
+    )
+
+    client = _RecordingClient()
+
+    from omnigent.cli_auth import open_server_client
+
+    @contextlib.asynccontextmanager
+    async def _fake_open_server_client(*_a: object, **_k: object):
+        yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _fake_open_server_client)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+        )
+    )
+    usage_posts: list[dict] = []
+    for _ in range(400):
+        usage_posts = [body for _, body in client.posts if body["type"] == "external_session_usage"]
+        if usage_posts and any(body["type"] == "external_model_change" for _, body in client.posts):
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert usage_posts, f"no usage post recorded; posts={client.posts}"
+    assert usage_posts[0]["data"]["cumulative_input_tokens"] == 300
+    assert usage_posts[0]["data"]["context_tokens"] == 1050
+    assert usage_posts[0]["data"]["context_window"] == 131_072
+    assert usage_posts[0]["data"]["model"] == "qwen-plus"
+    assert any(
+        body["type"] == "external_model_change" and body["data"]["model"] == "qwen-plus"
+        for _, body in client.posts
+    )
+    state = _read_state(bridge)
+    assert state.usage_input_tokens == 300
+    assert state.observed_model == "qwen-plus"

@@ -5034,10 +5034,15 @@ function sessionBindingPatch(
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
-    // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
-    // only for claude-/codex-native, which keep the composer model label.
+    // goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null only
+    // for claude-/codex-native, which keep the composer model label. Qwen
+    // picks its model inside the TUI too, but its forwarder mirrors the live
+    // model onto the session (reported_model → llmModel), so the chip shows
+    // the pane's truth instead of being hidden.
     nativeVendorOwnsModel:
-      isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
+      isNativeTerminalSessionFn(session) &&
+      nativeModelFamilyForSession(session) === null &&
+      session.labels?.["omnigent.wrapper"] !== "qwen-native-ui",
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: retainModelSeed ? state.llmModel : (session.llmModel ?? null),

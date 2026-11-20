@@ -35,6 +35,18 @@ forwarder posts ``external_session_status`` from either real turn boundary with
 the last assistant text, while the runner's PTY watcher remains a read-only UI
 signal.
 
+The forwarder also mirrors the **live model + per-turn token usage** off the
+same stream so the composer model chip, the context ring, and session cost
+reflect qwen's reality instead of staying hidden/zero: assistant message events
+carry ``message.model`` (e.g. ``openai/gpt-oss-120b:free``) and ``message.usage``
+(``input_tokens`` is cache-inclusive), and ``system/session_start`` carries
+model metadata. Usage is accumulated across turns (each model call bills its
+own full input, so the counts sum) and POSTed as ``external_session_usage``
+cumulative counters + ``context_tokens`` ring numerator; the window denominator
+comes from the curated :data:`_QWEN_CONTEXT_WINDOWS` lookup. The model is
+POSTed as ``external_model_change``. Both posts are SET-semantics and idempotent,
+so a failed POST is simply retried with the same snapshot on a later poll.
+
 This module also hosts the **compaction mirror** (:func:`supervise_qwen_compaction_mirror`).
 qwen compaction (its *compression*) is invisible on the ``--json-file`` stream
 (``session_start``'s ``supported_events`` omits it — verified live, ``qwen``
@@ -109,6 +121,18 @@ class _ForwardState:
         which we detect as ``size < offset`` and reset to 0.
     :param seen_uuids: Recently posted event uuids, for idempotent dedup across a
         truncation/restart. Bounded to the most recent entries.
+    :param usage_input_tokens: Cumulative non-cached input tokens reported so
+        far (SET semantics — the server monotonic-clamps, so a restart resumes
+        safely from the persisted counter).
+    :param usage_output_tokens: Cumulative output tokens reported so far.
+    :param usage_cache_read_tokens: Cumulative cache-read tokens reported so
+        far (the cached portion split out of qwen's cache-inclusive input).
+    :param last_context_tokens: Latest observed ``total_tokens`` — the context
+        ring numerator.
+    :param observed_model: Sticky last live model seen on the stream.
+    :param posted_model: Model successfully reported via ``external_model_change``.
+    :param posted_usage: Last ``external_session_usage`` snapshot accepted by
+        the server; the next report is skipped while unchanged.
     """
 
     offset: int = 0
@@ -117,6 +141,13 @@ class _ForwardState:
     # ``None`` means no assistant message is awaiting its ``message_stop``;
     # ``""`` represents qwen's JSON null/missing terminal stop reason.
     last_assistant_stop_reason: str | None = None
+    usage_input_tokens: int = 0
+    usage_output_tokens: int = 0
+    usage_cache_read_tokens: int = 0
+    last_context_tokens: int | None = None
+    observed_model: str | None = None
+    posted_model: str | None = None
+    posted_usage: dict[str, object] | None = None
 
 
 def _read_state(bridge_dir: Path) -> _ForwardState:
@@ -128,6 +159,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         return _ForwardState(offset=0, seen_uuids=[])
     offset = data.get("offset")
     seen = data.get("seen_uuids")
+    posted_usage = data.get("posted_usage")
     return _ForwardState(
         offset=offset if isinstance(offset, int) and offset >= 0 else 0,
         seen_uuids=[u for u in seen if isinstance(u, str)] if isinstance(seen, list) else [],
@@ -141,6 +173,13 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
             if isinstance(data.get("last_assistant_stop_reason"), str)
             else None
         ),
+        usage_input_tokens=data.get("usage_input_tokens") if isinstance(data.get("usage_input_tokens"), int) else 0,
+        usage_output_tokens=data.get("usage_output_tokens") if isinstance(data.get("usage_output_tokens"), int) else 0,
+        usage_cache_read_tokens=data.get("usage_cache_read_tokens") if isinstance(data.get("usage_cache_read_tokens"), int) else 0,
+        last_context_tokens=data.get("last_context_tokens") if isinstance(data.get("last_context_tokens"), int) else None,
+        observed_model=data.get("observed_model") if isinstance(data.get("observed_model"), str) else None,
+        posted_model=data.get("posted_model") if isinstance(data.get("posted_model"), str) else None,
+        posted_usage=posted_usage if isinstance(posted_usage, dict) else None,
     )
 
 
@@ -160,6 +199,13 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
                     "seen_uuids": seen,
                     "last_assistant_text": state.last_assistant_text,
                     "last_assistant_stop_reason": state.last_assistant_stop_reason,
+                    "usage_input_tokens": state.usage_input_tokens,
+                    "usage_output_tokens": state.usage_output_tokens,
+                    "usage_cache_read_tokens": state.usage_cache_read_tokens,
+                    "last_context_tokens": state.last_context_tokens,
+                    "observed_model": state.observed_model,
+                    "posted_model": state.posted_model,
+                    "posted_usage": state.posted_usage,
                 }
             ),
             encoding="utf-8",
@@ -313,6 +359,95 @@ def _event_to_terminal(
     )
 
 
+# --- live model + token usage mirror (model chip / context ring / cost) --------
+
+#: Curated context windows (tokens) for models qwen drives, matched by
+#: substring (lowercased, longest/most-specific token first). Windows follow
+#: the providers' published limits (Alibaba Model Studio qwen3-coder family,
+#: OpenRouter gpt-oss). Anything unrecognized falls back to
+#: :data:`_QWEN_DEFAULT_CONTEXT_WINDOW` — the same figure the bridge's synth
+#: session advertises — so the ring renders instead of staying hidden.
+_QWEN_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("qwen3-coder-plus", 1_000_000),
+    ("qwen3-coder-flash", 1_000_000),
+    ("qwen3-coder", 262_144),
+    ("qwen-max", 131_072),
+    ("qwen-plus", 131_072),
+    ("qwen-turbo", 1_000_000),
+    ("gpt-oss-120b", 131_072),
+    ("gpt-oss-20b", 131_072),
+)
+_QWEN_DEFAULT_CONTEXT_WINDOW = 131_072
+
+
+def _context_window_for(model: str | None) -> int:
+    """Resolve the context window for a live qwen model id."""
+    if model:
+        lowered = model.lower()
+        for token, window in _QWEN_CONTEXT_WINDOWS:
+            if token in lowered:
+                return window
+    return _QWEN_DEFAULT_CONTEXT_WINDOW
+
+
+def _int_token(value: object) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _normalize_qwen_usage(raw: dict[str, object]) -> dict[str, int]:
+    """Normalize one ``message.usage`` block for accumulation and reporting.
+
+    Qwen's ``input_tokens`` is cache-inclusive, but the server's cost
+    computation prices ``input_tokens`` at the full rate and
+    ``cache_read_input_tokens`` at the cache rate — so the cached portion is
+    split out of the input total (mirroring the ACP qwen executor).
+    """
+    cached = _int_token(raw.get("cache_read_input_tokens"))
+    return {
+        "input_tokens": max(0, _int_token(raw.get("input_tokens")) - cached),
+        "output_tokens": _int_token(raw.get("output_tokens")),
+        "cache_read_input_tokens": cached,
+        "total_tokens": _int_token(raw.get("total_tokens")),
+    }
+
+
+def _usage_and_model_from_event(event: dict[str, object]) -> tuple[dict[str, int] | None, str | None]:
+    """Extract per-call usage + the live model from one stream-json event.
+
+    Returns ``(usage, model)`` with either side ``None`` when the event
+    doesn't carry it. Only assistant and system events contribute: assistant
+    messages carry ``message.usage`` + ``message.model`` (verified qwen
+    v0.18.2), ``system/session_start`` carries model metadata (v0.18 wraps the
+    payload in ``data``).
+    """
+    etype = event.get("type")
+    usage: dict[str, int] | None = None
+    model: str | None = None
+    if etype == "assistant":
+        message = event.get("message")
+        if isinstance(message, dict):
+            raw_usage = message.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = _normalize_qwen_usage(raw_usage)
+            raw_model = message.get("model")
+            if isinstance(raw_model, str) and raw_model.strip():
+                model = raw_model.strip()
+    elif etype == "system":
+        payload = event.get("data") if isinstance(event.get("data"), dict) else event
+        raw_model = payload.get("model")
+        if not (isinstance(raw_model, str) and raw_model.strip()):
+            models = payload.get("models")
+            raw_model = next(
+                (m for m in models if isinstance(m, str) and m.strip())
+                if isinstance(models, list)
+                else (),
+                None,
+            )
+        if isinstance(raw_model, str) and raw_model.strip():
+            model = raw_model.strip()
+    return usage, model
+
+
 def _read_new_forward_events(
     events_file: Path,
     offset: int,
@@ -320,30 +455,43 @@ def _read_new_forward_events(
     agent_name: str,
     last_assistant_text: str,
     last_assistant_stop_reason: str | None = None,
-) -> tuple[list[_MirrorItem | _TerminalStatus], int, str, str | None]:
-    """Read mirror items and terminal records in wire order past *offset*."""
+) -> tuple[
+    list[_MirrorItem | _TerminalStatus],
+    int,
+    str,
+    str | None,
+    list[tuple[dict[str, int] | None, str | None]],
+]:
+    """Read mirror items, terminal records and usage/model observations past *offset*.
+
+    The usage/model observations are returned per consumed event in wire order
+    (``(usage, model)`` with either side ``None``) and are folded into the
+    cumulative report separately from the item dedup: they aggregate even for
+    events that produce no mirror item (tool-only turns still bill tokens).
+    """
     try:
         size = events_file.stat().st_size
     except OSError:
-        return [], offset, last_assistant_text, last_assistant_stop_reason
+        return [], offset, last_assistant_text, last_assistant_stop_reason, []
     if size < offset:
         offset = 0
         last_assistant_text = ""
         last_assistant_stop_reason = None
     if size == offset:
-        return [], offset, last_assistant_text, last_assistant_stop_reason
+        return [], offset, last_assistant_text, last_assistant_stop_reason, []
     try:
         with open(events_file, "rb") as fh:
             fh.seek(offset)
             data = fh.read(size - offset)
     except OSError:
-        return [], offset, last_assistant_text, last_assistant_stop_reason
+        return [], offset, last_assistant_text, last_assistant_stop_reason, []
     last_nl = data.rfind(b"\n")
     if last_nl == -1:
-        return [], offset, last_assistant_text, last_assistant_stop_reason
+        return [], offset, last_assistant_text, last_assistant_stop_reason, []
     consumed = data[: last_nl + 1]
     new_offset = offset + len(consumed)
     actions: list[_MirrorItem | _TerminalStatus] = []
+    observations: list[tuple[dict[str, int] | None, str | None]] = []
     encountered = set(seen)
     for raw in consumed.split(b"\n"):
         raw = raw.strip()
@@ -360,6 +508,9 @@ def _read_new_forward_events(
         assistant_stop_reason = _assistant_stop_reason(event)
         if assistant_stop_reason is not None:
             last_assistant_stop_reason = assistant_stop_reason
+        usage, model = _usage_and_model_from_event(event)
+        if usage is not None or model is not None:
+            observations.append((usage, model))
         item = _event_to_item(event, agent_name)
         if item is not None and item.uuid not in encountered:
             actions.append(item)
@@ -372,7 +523,7 @@ def _read_new_forward_events(
             encountered.add(terminal.uuid)
             last_assistant_text = ""
             last_assistant_stop_reason = None
-    return actions, new_offset, last_assistant_text, last_assistant_stop_reason
+    return actions, new_offset, last_assistant_text, last_assistant_stop_reason, observations
 
 
 def _assistant_text_after_action(current: str, action: _MirrorItem | _TerminalStatus) -> str:
@@ -424,6 +575,85 @@ async def _post_external_session_status(
         json={"type": "external_session_status", "data": data},
     )
     resp.raise_for_status()
+
+
+async def _post_external_session_usage(
+    client: httpx.AsyncClient, *, session_id: str, state: _ForwardState
+) -> None:
+    """POST the cumulative usage + context-window snapshot; skip while unchanged."""
+    if state.last_context_tokens is None and state.observed_model is None:
+        return  # nothing observed yet — nothing the server would accept
+    snapshot: dict[str, object] = {
+        "cumulative_input_tokens": state.usage_input_tokens,
+        "cumulative_output_tokens": state.usage_output_tokens,
+        "cumulative_cache_read_input_tokens": state.usage_cache_read_tokens,
+        "context_tokens": state.last_context_tokens,
+        "context_window": _context_window_for(state.observed_model),
+    }
+    if state.observed_model is not None:
+        snapshot["model"] = state.observed_model
+    if snapshot == state.posted_usage:
+        return
+    data = {key: value for key, value in snapshot.items() if value is not None}
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    resp.raise_for_status()
+    state.posted_usage = snapshot
+
+
+async def _post_external_model_change(
+    client: httpx.AsyncClient, *, session_id: str, model: str
+) -> None:
+    """POST one ``external_model_change`` so surfaces show the pane's live model."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_model_change", "data": {"model": model}},
+    )
+    resp.raise_for_status()
+
+
+async def _report_usage_and_model(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    state: _ForwardState,
+    observations: list[tuple[dict[str, int] | None, str | None]],
+) -> None:
+    """Fold one batch's usage/model observations into the report and POST it.
+
+    Usage accumulates across observations (each model call bills its own full
+    input). Posts are best-effort and idempotent — a failure leaves
+    ``posted_usage`` / ``posted_model`` behind so the next poll retries with
+    the same SET-semantics snapshot, and the counters are persisted by the
+    caller even after a failure so the retry can't double-count.
+    """
+    for usage, model in observations:
+        if usage is not None:
+            state.usage_input_tokens += usage["input_tokens"]
+            state.usage_output_tokens += usage["output_tokens"]
+            state.usage_cache_read_tokens += usage["cache_read_input_tokens"]
+            state.last_context_tokens = usage["total_tokens"]
+        if model is not None:
+            state.observed_model = model
+    try:
+        await _post_external_session_usage(client, session_id=session_id, state=state)
+    except httpx.HTTPError:
+        _logger.warning(
+            "qwen forwarder usage report failed; session=%s", session_id, exc_info=True
+        )
+    if state.observed_model is not None and state.observed_model != state.posted_model:
+        try:
+            await _post_external_model_change(
+                client, session_id=session_id, model=state.observed_model
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "qwen forwarder model report failed; session=%s", session_id, exc_info=True
+            )
+        else:
+            state.posted_model = state.observed_model
 
 
 async def _deliver_forward_actions(
@@ -491,6 +721,7 @@ async def forward_qwen_events_to_session(
                     new_offset,
                     next_assistant_text,
                     next_assistant_stop_reason,
+                    observations,
                 ) = await asyncio.to_thread(
                     _read_new_forward_events,
                     target,
@@ -506,6 +737,9 @@ async def forward_qwen_events_to_session(
                     bridge_dir=bridge_dir,
                     state=state,
                     actions=actions,
+                )
+                await _report_usage_and_model(
+                    client, session_id=session_id, state=state, observations=observations
                 )
                 if new_offset != state.offset or actions:
                     state.offset = new_offset
