@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.process_logging import data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,24 @@ def _inline_text_file_data(file_data: object) -> str:
         return ""
 
 
+def _parse_data_uri(data_uri: object) -> tuple[str, str] | None:
+    """Split an inline ``data:`` URI into ``(mime_type, base64_payload)``.
+
+    Returns ``None`` for anything that isn't an inline data URI with a
+    non-empty payload (external URLs are never fetched — SSRF).
+    """
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    try:
+        meta, payload = data_uri.split(",", 1)
+    except ValueError:
+        return None
+    mime = meta.split(";")[0].replace("data:", "")
+    if not mime or not payload:
+        return None
+    return mime, payload
+
+
 def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     """Split an ``image/*`` ``data:`` URI into ``(mime_type, base64_payload)``.
 
@@ -204,16 +224,21 @@ def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     :param data_uri: A block's ``image_url`` / ``file_data`` value (or ``None``).
     :returns: ``(mime_type, base64_payload)`` for an image data URI, else ``None``.
     """
-    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+    parsed = _parse_data_uri(data_uri)
+    if parsed is None or not parsed[0].startswith("image/"):
         return None
-    try:
-        meta, payload = data_uri.split(",", 1)
-    except ValueError:
-        return None
-    mime = meta.split(";")[0].replace("data:", "")
-    if not mime.startswith("image/") or not payload:
-        return None
-    return mime, payload
+    return parsed
+
+
+def _session_state_path(session_key: str) -> Path:
+    """On-disk state file remembering one conversation's qwen ACP session id.
+
+    Keyed by a digest of the Omnigent conversation id so a later run (or a
+    respawned subprocess) can offer ``session/load`` the same server-assigned
+    session id and resume qwen's own on-disk recording.
+    """
+    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+    return data_dir() / "qwen-acp-sessions" / f"{digest}.json"
 
 
 class QwenExecutor(Executor):
@@ -231,6 +256,7 @@ class QwenExecutor(Executor):
         qwen_path: str | None = None,
         gateway_base_url: str | None = None,
         gateway_auth_command: str | None = None,
+        session_key: str | None = None,
     ) -> None:
         """Initialize the Qwen executor.
 
@@ -254,9 +280,21 @@ class QwenExecutor(Executor):
         :param gateway_auth_command: Shell command that prints a bearer token to
             stdout (from ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND``); run once at
             process start to snapshot ``OPENAI_API_KEY``.
+        :param session_key: Stable Omnigent conversation id (from
+            ``HARNESS_QWEN_SESSION_ID``). When set, the executor keys qwen's
+            on-disk session to a deterministic id and remembers the
+            server-assigned session id under the data dir, so a later run (or a
+            respawned subprocess) can ``session/load`` qwen's own recording
+            instead of replaying history into a fresh session. ``None``
+            disables persistence (standalone / test use).
         """
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
+        # Stable Omnigent conversation id (HARNESS_QWEN_SESSION_ID), when the
+        # runner threaded one into the spawn env. Keys the deterministic
+        # session/new hint and the on-disk session-id state file used by
+        # session/load resume — see _try_restore_session.
+        self._session_key = session_key or None
         # Whether to advertise ``clientCapabilities.fs`` so qwen delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
         # which enforces the spec's sandbox read/write roots) instead of using
@@ -317,6 +355,21 @@ class QwenExecutor(Executor):
         # vision-capable models can see them; when False they degrade to a text
         # ``[attached image: <name>]`` marker rather than vanishing.
         self._image_supported: bool = False
+        # Same handshake, for ``audio`` blocks and embedded ``resource`` blocks
+        # (PDF documents ride a resource blob — see _media_blocks_from_content).
+        # Older qwen builds advertise neither; attachments then degrade to the
+        # text marker path, as before.
+        self._audio_supported: bool = False
+        self._embedded_context_supported: bool = False
+        # ``agentCapabilities.loadSession`` — qwen supports ACP session/load,
+        # which restores one of its on-disk recordings into the live process.
+        # Gates the cross-run / post-crash resume in _try_restore_session.
+        self._load_session_supported: bool = False
+        # Per-model modality table from the session/new (or session/load)
+        # ``models`` list: modelId -> {image, pdf, audio, video}. qwen derives
+        # these from its bundled model registry; used to warn when an
+        # attachment's modality exceeds the active model (see _capability_warning).
+        self._model_modalities: dict[str, dict[str, bool]] = {}
 
         # Whether the system prompt has been folded into a turn already.
         # ACP has no dedicated system-prompt field, so we prepend it to the
@@ -365,10 +418,13 @@ class QwenExecutor(Executor):
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch, so without
         # this the new process would skip ``initialize`` and qwen would
-        # reject the subsequent ``session/new``. ``_image_supported`` is
-        # derived from the initialize response, so it's stale too.
+        # reject the subsequent ``session/new``. The capability flags are
+        # derived from the initialize response, so they're stale too.
         self._initialized = False
         self._image_supported = False
+        self._audio_supported = False
+        self._embedded_context_supported = False
+        self._load_session_supported = False
         env = await self._build_spawn_env()
         # Resolve the path to spawn: the bare qwen binary, or a sandbox launcher
         # that confines the whole process tree when os_env requests it.
@@ -793,19 +849,29 @@ class QwenExecutor(Executor):
             raise RuntimeError(
                 f"qwen ACP initialize failed: {resp['error'].get('message', resp['error'])}"
             )
-        prompt_caps = (
-            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
-        )
+        agent_caps = (resp.get("result") or {}).get("agentCapabilities") or {}
+        prompt_caps = agent_caps.get("promptCapabilities") or {}
         self._image_supported = bool(prompt_caps.get("image"))
+        self._audio_supported = bool(prompt_caps.get("audio"))
+        self._embedded_context_supported = bool(prompt_caps.get("embeddedContext"))
+        self._load_session_supported = bool(agent_caps.get("loadSession"))
         self._initialized = True
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning its server-assigned id.
 
+        A fresh process first offers ``session/load`` any persisted session id
+        (cross-run resume — see :meth:`_try_restore_session`); when that fails
+        or nothing is persisted, a new session is created.
+
         :returns: The session id string assigned by qwen.
         """
         if self._session_id is not None:
             return self._session_id
+
+        restored = await self._try_restore_session()
+        if restored is not None:
+            return restored
 
         mcp_servers = self._mcp.session_new_servers(
             tools=self._omnigent_tools,
@@ -813,7 +879,11 @@ class QwenExecutor(Executor):
             loop=asyncio.get_event_loop(),
         )
         params: _AcpJsonObject = {
-            "sessionId": secrets.token_urlsafe(16),
+            # With a conversation key the hint is deterministic so qwen's
+            # on-disk recording is keyed per conversation and a later run can
+            # session/load it; qwen still may remap on conflict (the server
+            # id is what we persist and reuse).
+            "sessionId": self._new_session_hint(),
             "cwd": self._cwd,
             "mcpServers": mcp_servers,
         }
@@ -831,13 +901,188 @@ class QwenExecutor(Executor):
         # the server returns, not what we sent.
         result = resp.get("result", {})
         self._note_config_options(result.get("configOptions"))
+        self._note_available_models(result.get("models"))
         server_session_id = result.get("sessionId")
         if not server_session_id:
             raise RuntimeError(
                 "qwen ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = server_session_id
+        self._persist_session()
         return self._session_id
+
+    def _new_session_hint(self) -> str:
+        """The ``sessionId`` hint for ``session/new``.
+
+        Deterministic per conversation when a session key is configured (so
+        qwen's recording is findable by a later run); random otherwise.
+        """
+        if self._session_key:
+            digest = hashlib.sha256(self._session_key.encode("utf-8")).hexdigest()[:24]
+            return f"omnigent-{digest}"
+        return secrets.token_urlsafe(16)
+
+    def _load_persisted_session(self) -> str | None:
+        """Read the remembered qwen session id for this conversation, if any.
+
+        The state file also records the cwd the session was created under:
+        qwen resolves its recordings per project, so a session persisted for
+        a different workspace cannot be loaded and must not be offered.
+        """
+        if not self._session_key:
+            return None
+        try:
+            raw = _session_state_path(self._session_key).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("cwd") != self._cwd:
+            return None
+        session_id = data.get("session_id")
+        return session_id if isinstance(session_id, str) and session_id else None
+
+    def _persist_session(self) -> None:
+        """Remember the server-assigned session id for cross-run resume.
+
+        Best-effort: a write failure only means the next run falls back to
+        the fresh-session history replay. Note the file is useless under
+        gateway routing — the isolated per-executor HOME holding qwen's
+        recordings is removed in :meth:`close` — but harmless: session/load
+        then simply fails and the fallback path runs.
+        """
+        if not self._session_key or not self._session_id:
+            return
+        path = _session_state_path(self._session_key)
+        payload = json.dumps({"session_id": self._session_id, "cwd": self._cwd})
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.debug("qwen: could not persist ACP session id: %s", exc)
+
+    async def _try_restore_session(self) -> str | None:
+        """Resume this conversation's qwen session via ACP ``session/load``.
+
+        qwen records sessions on disk keyed per project; ``session/load``
+        restores a recording (including its compaction state and the folded
+        system prompt) into a fresh process. On success the restored session
+        already holds the whole conversation, so ``_system_prompt_sent`` is
+        set — :meth:`run_turn` must NOT replay Omnigent history or re-fold
+        the system prompt into it.
+
+        Any failure (no capability, nothing persisted, qwen error — e.g.
+        recording pruned or a different qwen HOME) returns ``None`` and the
+        caller falls back to ``session/new`` plus the history replay.
+
+        :returns: The restored session id, or ``None`` to create a new session.
+        """
+        if not self._load_session_supported:
+            return None
+        persisted = self._load_persisted_session()
+        if not persisted:
+            return None
+        resp = await self._rpc(
+            "session/load",
+            {"sessionId": persisted, "cwd": self._cwd},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" in resp:
+            logger.info(
+                "qwen session/load of %s failed (%s); starting a fresh session",
+                persisted,
+                resp["error"].get("message", resp["error"]),
+            )
+            return None
+        result = resp.get("result") or {}
+        self._note_config_options(result.get("configOptions"))
+        self._note_available_models(result.get("models"))
+        self._session_id = persisted
+        # The recording already contains the system prompt (folded into the
+        # first turn when the session was created) and the full history.
+        self._system_prompt_sent = True
+        logger.info("qwen: resumed ACP session %s via session/load", persisted)
+        return self._session_id
+
+    def _note_available_models(self, models: object) -> None:
+        """Record per-model modality metadata from a session response.
+
+        qwen's session responses carry a ``models`` list whose entries may
+        include ``modalities`` (``image`` / ``pdf`` / ``audio`` / ``video``)
+        from its bundled model registry. Surfaced to the user as an
+        attachment-capability warning — see :meth:`_capability_warning`.
+
+        :param models: The response's ``models`` value (list or nothing).
+        """
+        if not isinstance(models, list):
+            return
+        for entry in models:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("modelId")
+            modalities = entry.get("modalities")
+            if not isinstance(model_id, str) or not isinstance(modalities, dict):
+                continue
+            parsed = {
+                str(key): bool(value)
+                for key, value in modalities.items()
+                if key in ("image", "pdf", "audio", "video")
+            }
+            if parsed:
+                self._model_modalities[model_id] = parsed
+
+    def _active_modalities(self) -> dict[str, bool] | None:
+        """Modality metadata for the active model, when qwen reported it.
+
+        Matches the active model id against the session's models list, trying
+        the id as-is, without its ``provider/`` prefix, and without its
+        ``:tag`` suffix — qwen's registry keys vary between the three.
+        ``None`` when unknown: callers then stay silent rather than warn
+        spuriously.
+        """
+        candidates = [self._active_model, self._model]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            tail = candidate.rsplit("/", 1)[-1]
+            base = tail.split(":", 1)[0]
+            for key in (candidate, tail, base):
+                modalities = self._model_modalities.get(key)
+                if modalities is not None:
+                    return modalities
+        return None
+
+    def _capability_warning(self, prompt_blocks: Sequence[_AcpJsonObject]) -> str | None:
+        """One-line user-visible warning when an attachment exceeds the model.
+
+        qwen itself swaps unsupported media for a text placeholder, which
+        reads to the user as the model "ignoring" the attachment. When the
+        session told us the active model's modalities, say so up front.
+
+        :param prompt_blocks: The ACP prompt blocks about to be sent.
+        :returns: The warning text, or ``None`` when nothing is unsupported.
+        """
+        modalities = self._active_modalities()
+        if not modalities:
+            return None
+        unsupported: list[str] = []
+        for block in prompt_blocks:
+            block_type = block.get("type")
+            if block_type == "image" and modalities.get("image") is False:
+                unsupported.append("images")
+            elif block_type == "audio" and modalities.get("audio") is False:
+                unsupported.append("audio")
+            elif block_type == "resource" and modalities.get("pdf") is False:
+                unsupported.append("PDF documents")
+        if not unsupported:
+            return None
+        kinds = ", ".join(dict.fromkeys(unsupported))
+        model = self._active_model or self._model or "the current model"
+        return (
+            f"Note: {model} does not support {kinds}, so the attachment "
+            "will reach it as a text placeholder rather than its real content."
+        )
 
     def _note_config_options(self, options: object) -> str | None:
         """Record advertised session options and the active model."""
@@ -1312,10 +1557,71 @@ class QwenExecutor(Executor):
         return out
 
     @staticmethod
+    def _media_blocks_from_content(
+        content: object,
+        *,
+        audio_supported: bool,
+        embedded_context_supported: bool,
+    ) -> tuple[list[_AcpJsonObject], frozenset[int]]:
+        """Build ACP ``audio`` / ``resource`` prompt blocks from ``input_file`` blocks.
+
+        The runner resolves every non-image attachment into an inline
+        ``file_data`` data URI (PDF and audio keep their true MIME). qwen's
+        ACP accepts those out-of-band:
+
+        - ``audio/*`` → ``{"type": "audio", "mimeType", "data"}`` (qwen
+          converts it to the model's ``input_audio`` part).
+        - ``application/pdf`` → ``{"type": "resource", "resource": {uri,
+          mimeType, "blob"}}``; qwen lifts the blob into an inline document
+          the model receives as a file part.
+
+        Both are gated on the corresponding ``initialize`` prompt capability;
+        when a capability is absent the block is not built and the caller's
+        text fold leaves the usual ``[attached file: …]`` marker instead.
+
+        :param content: A message's ``content`` (block list, or non-list → none).
+        :param audio_supported: The handshake's ``promptCapabilities.audio``.
+        :param embedded_context_supported: The handshake's
+            ``promptCapabilities.embeddedContext``.
+        :returns: ``(blocks, forwarded_indexes)`` — the ACP blocks and the
+            content indexes they were built from (the text fold skips those
+            indexes so a forwarded attachment isn't also a text marker).
+        """
+        blocks: list[_AcpJsonObject] = []
+        forwarded: set[int] = set()
+        if not isinstance(content, list):
+            return blocks, frozenset()
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "input_file":
+                continue
+            parsed = _parse_data_uri(block.get("file_data"))
+            if parsed is None:
+                continue
+            mime, payload = parsed
+            name = block.get("filename") or block.get("file_id") or "file"
+            if mime.startswith("audio/") and audio_supported:
+                blocks.append({"type": "audio", "mimeType": mime, "data": payload})
+                forwarded.add(index)
+            elif mime == "application/pdf" and embedded_context_supported:
+                blocks.append(
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": f"file:///{name}",
+                            "mimeType": mime,
+                            "blob": payload,
+                        },
+                    }
+                )
+                forwarded.add(index)
+        return blocks, frozenset(forwarded)
+
+    @staticmethod
     def _text_from_blocks(
         blocks: list[object],
         *,
         emit_image_marker: bool = False,
+        skip_file_indexes: frozenset[int] = frozenset(),
     ) -> str:
         """Extract prompt text from a Responses-API content-block list.
 
@@ -1332,12 +1638,17 @@ class QwenExecutor(Executor):
           ``[attached file: <name>]`` marker so the attachment isn't silently
           dropped. The fence keeps the action request and the file body
           separate — bare-appending raw content derails weaker models into
-          narrating tool calls as prose (full file delivery via ``file_id`` and
-          audio input are deferred — see docs/QWEN_FOLLOWUPS.md).
+          narrating tool calls as prose (see docs/QWEN_FOLLOWUPS.md). Binary
+          documents (PDF) and audio ride real ACP media blocks instead —
+          see :meth:`_media_blocks_from_content`.
         - ``input_image`` → handled out-of-band as a real ACP ``image`` prompt
           block (:meth:`_image_blocks_from_content`); this fold emits a
           ``[attached image: <name>]`` marker only when *emit_image_marker* is
           set (qwen lacks image capability), so the image isn't silently lost.
+        - Binary ``input_file`` blocks forwarded out-of-band as ACP media
+          blocks (:meth:`_media_blocks_from_content`) are skipped entirely
+          when their content index is in *skip_file_indexes* — the bytes ride
+          the media block, so a text marker would be a duplicate.
 
         Crucially, the block ``type`` is ``input_text`` (not ``text``): the
         previous ``type == "text"`` filter matched nothing, dropping the whole
@@ -1348,10 +1659,13 @@ class QwenExecutor(Executor):
             …]`` marker for each ``input_image`` (used when qwen can't accept a
             real image block); when ``False``, skip images here (the caller
             forwards them as ACP image blocks).
+        :param skip_file_indexes: Content indexes whose ``input_file`` blocks
+            were forwarded as ACP media blocks; skipped instead of emitted as
+            ``[attached file: …]`` markers.
         :returns: The concatenated prompt text (may be empty).
         """
         parts: list[str] = []
-        for block in blocks:
+        for index, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
@@ -1360,6 +1674,8 @@ class QwenExecutor(Executor):
                 if isinstance(text, str) and text:
                     parts.append(text)
             elif btype == "input_file":
+                if index in skip_file_indexes:
+                    continue
                 name = block.get("filename") or block.get("file_id") or "file"
                 inlined = _inline_text_file_data(block.get("file_data"))
                 if inlined:
@@ -1381,8 +1697,9 @@ class QwenExecutor(Executor):
                 # can, the image is sent via _image_blocks_from_content instead.
                 name = block.get("filename") or block.get("file_id")
                 parts.append(f"[attached image: {name}]" if name else "[attached image]")
-            # input_audio: no audio over the ACP text prompt yet (deferred —
-            # see docs/QWEN_FOLLOWUPS.md).
+            # Audio arrives as input_file with an audio/* file_data URI and is
+            # forwarded as a real ACP audio block (see _media_blocks_from_content);
+            # nothing to fold into text here.
         return "\n".join(parts)
 
     @classmethod
@@ -1507,6 +1824,8 @@ class QwenExecutor(Executor):
         # Build the prompt payload from the most recent user message.
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
+        media_blocks: list[_AcpJsonObject] = []
+        forwarded_file_indexes: frozenset[int] = frozenset()
         latest_user_idx: int | None = None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
@@ -1522,8 +1841,18 @@ class QwenExecutor(Executor):
                     # fall back to a text marker so they aren't silently dropped.
                     if self._image_supported:
                         image_blocks = self._image_blocks_from_content(content)
+                    # Binary documents (PDF) and audio ride real ACP media
+                    # blocks when the handshake advertises the capabilities;
+                    # forwarded blocks are excluded from the text fold below.
+                    media_blocks, forwarded_file_indexes = self._media_blocks_from_content(
+                        content,
+                        audio_supported=self._audio_supported,
+                        embedded_context_supported=self._embedded_context_supported,
+                    )
                     user_text = self._text_from_blocks(
-                        content, emit_image_marker=not self._image_supported
+                        content,
+                        emit_image_marker=not self._image_supported,
+                        skip_file_indexes=forwarded_file_indexes,
                     )
                 break
 
@@ -1546,11 +1875,20 @@ class QwenExecutor(Executor):
                 user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
-        # Text first, then any image blocks (ACP prompt is an ordered array).
+        # Text first, then any media blocks (ACP prompt is an ordered array).
         prompt_blocks: list[_AcpJsonObject] = []
-        if user_text or not image_blocks:
+        if user_text or not (image_blocks or media_blocks):
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
+        prompt_blocks.extend(media_blocks)
+
+        # If the session told us the active model's modalities and this turn
+        # carries an attachment the model can't process, say so up front —
+        # qwen would otherwise silently swap the media for a text placeholder.
+        capability_warning = self._capability_warning(prompt_blocks)
+        if capability_warning:
+            logger.info("qwen: %s", capability_warning)
+            yield TextChunk(text=capability_warning)
 
         # Drain stale items from a prior turn. Notifications (no ``id``) are
         # safe to drop, but a server-initiated *request* left in the queue is

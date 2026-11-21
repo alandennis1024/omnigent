@@ -2672,3 +2672,500 @@ async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh
         assert prompts[0]["params"]["prompt"] == [
             {"type": "text", "text": content if isinstance(content, str) else ""}
         ]
+
+
+# ---------------------------------------------------------------------------
+# Binary document (PDF) + audio attachments ride real ACP media blocks
+# ---------------------------------------------------------------------------
+
+
+def test_media_blocks_builds_pdf_resource_block() -> None:
+    """An input_file PDF with embeddedContext capability becomes an ACP resource."""
+    content = [
+        {"type": "input_text", "text": "summarize this"},
+        {
+            "type": "input_file",
+            "file_data": "data:application/pdf;base64,JVBE",
+            "filename": "report.pdf",
+        },
+    ]
+    blocks, forwarded = QwenExecutor._media_blocks_from_content(
+        content, audio_supported=True, embedded_context_supported=True
+    )
+    assert blocks == [
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "file:///report.pdf",
+                "mimeType": "application/pdf",
+                "blob": "JVBE",
+            },
+        }
+    ]
+    assert forwarded == frozenset({1})
+
+
+def test_media_blocks_builds_audio_block() -> None:
+    """An input_file audio/* with the audio capability becomes an ACP audio block."""
+    content = [
+        {"type": "input_text", "text": "transcribe"},
+        {
+            "type": "input_file",
+            "file_data": "data:audio/mpeg;base64,//uQ",
+            "filename": "voice.mp3",
+        },
+    ]
+    blocks, forwarded = QwenExecutor._media_blocks_from_content(
+        content, audio_supported=True, embedded_context_supported=True
+    )
+    assert blocks == [{"type": "audio", "mimeType": "audio/mpeg", "data": "//uQ"}]
+    assert forwarded == frozenset({1})
+
+
+def test_media_blocks_gated_on_capabilities() -> None:
+    """Without the matching handshake capability no media block is built."""
+    content = [
+        {
+            "type": "input_file",
+            "file_data": "data:application/pdf;base64,JVBE",
+            "filename": "d.pdf",
+        },
+        {
+            "type": "input_file",
+            "file_data": "data:audio/wav;base64,UklR",
+            "filename": "a.wav",
+        },
+    ]
+    # Neither capability.
+    blocks, forwarded = QwenExecutor._media_blocks_from_content(
+        content, audio_supported=False, embedded_context_supported=False
+    )
+    assert blocks == []
+    assert forwarded == frozenset()
+    # Only audio.
+    blocks, forwarded = QwenExecutor._media_blocks_from_content(
+        content, audio_supported=True, embedded_context_supported=False
+    )
+    assert [b["type"] for b in blocks] == ["audio"]
+    assert forwarded == frozenset({1})
+    # Only embedded context (PDF).
+    blocks, forwarded = QwenExecutor._media_blocks_from_content(
+        content, audio_supported=False, embedded_context_supported=True
+    )
+    assert [b["type"] for b in blocks] == ["resource"]
+    assert forwarded == frozenset({0})
+
+
+def test_media_blocks_skips_text_and_malformed_files() -> None:
+    """Text files (inlined into the prompt) and non-data URIs are not media blocks."""
+    content = [
+        {"type": "input_file", "file_data": "data:text/plain;base64,aGk=", "filename": "t.txt"},
+        {"type": "input_file", "file_data": "not-a-data-uri", "filename": "u.bin"},
+        {"type": "input_file", "filename": "no-data.pdf"},
+    ]
+    blocks, forwarded = QwenExecutor._media_blocks_from_content(
+        content, audio_supported=True, embedded_context_supported=True
+    )
+    assert blocks == []
+    assert forwarded == frozenset()
+
+
+def test_text_from_blocks_skips_forwarded_files_only() -> None:
+    """Forwarded blocks lose their marker; other binary files keep it."""
+    blocks = [
+        {
+            "type": "input_file",
+            "file_data": "data:application/pdf;base64,JVBE",
+            "filename": "d.pdf",
+        },
+        {
+            "type": "input_file",
+            "file_data": "data:application/zip;base64,UEs=",
+            "filename": "z.zip",
+        },
+    ]
+    out = QwenExecutor._text_from_blocks(blocks, skip_file_indexes=frozenset({0}))
+    assert "[attached file: d.pdf]" not in out
+    assert "[attached file: z.zip]" in out
+
+
+@pytest.mark.asyncio
+async def test_run_turn_sends_media_blocks_without_markers() -> None:
+    """PDF + audio attachments arrive as ACP media blocks, not text markers."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-media"
+    executor._system_prompt_sent = True
+    executor._image_supported = True
+    executor._audio_supported = True
+    executor._embedded_context_supported = True
+    executor._proc = MagicMock(returncode=None)
+    sent: list[dict] = []
+
+    async def fake_send(msg: dict) -> None:
+        sent.append(msg)
+        executor._pending[msg["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "please review"},
+                {
+                    "type": "input_file",
+                    "file_data": "data:application/pdf;base64,JVBE",
+                    "filename": "d.pdf",
+                },
+                {
+                    "type": "input_file",
+                    "file_data": "data:audio/mpeg;base64,//uQ",
+                    "filename": "a.mp3",
+                },
+            ],
+        }
+    ]
+    events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    prompt = sent[0]["params"]["prompt"]
+    assert prompt[0] == {"type": "text", "text": "please review"}
+    assert prompt[1]["type"] == "resource"
+    assert prompt[1]["resource"]["blob"] == "JVBE"
+    assert prompt[2] == {"type": "audio", "mimeType": "audio/mpeg", "data": "//uQ"}
+    assert "[attached file" not in prompt[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_marker_when_capability_absent() -> None:
+    """No embeddedContext capability → PDF degrades to the text marker."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-marker"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock(returncode=None)
+    sent: list[dict] = []
+
+    async def fake_send(msg: dict) -> None:
+        sent.append(msg)
+        executor._pending[msg["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "please review"},
+                {
+                    "type": "input_file",
+                    "file_data": "data:application/pdf;base64,JVBE",
+                    "filename": "d.pdf",
+                },
+            ],
+        }
+    ]
+    events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    prompt = sent[0]["params"]["prompt"]
+    assert len(prompt) == 1
+    assert "[attached file: d.pdf]" in prompt[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Model capability surfacing (modalities from the session handshake)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_initialized_captures_all_prompt_capabilities() -> None:
+    """initialize records audio / embeddedContext / loadSession alongside image."""
+    executor = QwenExecutor(model="m")
+    executor._rpc = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "result": {
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "promptCapabilities": {"image": True, "audio": True, "embeddedContext": True},
+                }
+            }
+        }
+    )
+    await executor._ensure_initialized()
+    assert executor._image_supported is True
+    assert executor._audio_supported is True
+    assert executor._embedded_context_supported is True
+    assert executor._load_session_supported is True
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_model_modalities() -> None:
+    """The session/new models list feeds the per-model modality table."""
+    executor = QwenExecutor()
+    executor._initialized = True
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        assert method == "session/new"
+        return {
+            "result": {
+                "sessionId": "s1",
+                "models": [
+                    {"modelId": "qwen3-coder-plus", "modalities": {"image": True, "pdf": True}},
+                    {"modelId": "qwen3-coder:free", "modalities": {"image": False, "pdf": False}},
+                ],
+            }
+        }
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+    assert executor._model_modalities["qwen3-coder-plus"]["image"] is True
+    assert executor._model_modalities["qwen3-coder:free"]["image"] is False
+
+
+@pytest.mark.asyncio
+async def test_capability_warning_when_model_lacks_modality() -> None:
+    """A text-only model + image attachment yields a user-visible warning chunk."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-warn"
+    executor._system_prompt_sent = True
+    executor._image_supported = True
+    executor._active_model = "qwen/qwen3-coder:free"
+    executor._model_modalities = {
+        "qwen3-coder:free": {"image": False, "pdf": False, "audio": False}
+    }
+    executor._proc = MagicMock(returncode=None)
+    sent: list[dict] = []
+
+    async def fake_send(msg: dict) -> None:
+        sent.append(msg)
+        executor._pending[msg["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBOR"},
+            ],
+        }
+    ]
+    events = [e async for e in executor.run_turn(messages, [], "")]
+
+    warnings = [e for e in events if isinstance(e, TextChunk) and "does not support" in e.text]
+    assert len(warnings) == 1
+    assert "qwen/qwen3-coder:free" in warnings[0].text
+    assert "images" in warnings[0].text
+
+
+@pytest.mark.asyncio
+async def test_no_capability_warning_when_modalities_support_attachment() -> None:
+    """A vision-capable model produces no warning chunk for an image turn."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-ok"
+    executor._system_prompt_sent = True
+    executor._image_supported = True
+    executor._active_model = "qwen3-coder-plus"
+    executor._model_modalities = {"qwen3-coder-plus": {"image": True, "pdf": True}}
+    executor._proc = MagicMock(returncode=None)
+    sent: list[dict] = []
+
+    async def fake_send(msg: dict) -> None:
+        sent.append(msg)
+        executor._pending[msg["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBOR"},
+            ],
+        }
+    ]
+    events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert not [e for e in events if isinstance(e, TextChunk) and "does not support" in e.text]
+
+
+# ---------------------------------------------------------------------------
+# ACP session resume across runs (session/load + persisted session id)
+# ---------------------------------------------------------------------------
+
+
+def test_new_session_hint_deterministic_with_key() -> None:
+    """A conversation key makes the session/new hint stable across runs."""
+    one = QwenExecutor(session_key="conv-1")
+    two = QwenExecutor(session_key="conv-1")
+    other = QwenExecutor(session_key="conv-2")
+    assert one._new_session_hint() == two._new_session_hint()
+    assert one._new_session_hint() != other._new_session_hint()
+    assert one._new_session_hint().startswith("omnigent-")
+
+
+def test_new_session_hint_random_without_key() -> None:
+    """Without a conversation key the hint stays random (standalone/test)."""
+    executor = QwenExecutor()
+    assert executor._new_session_hint() != executor._new_session_hint()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_persists_server_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After session/new the server-assigned id is written under the data dir."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    executor = QwenExecutor(session_key="conv-persist", cwd="/ws")
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        assert method == "session/new"
+        assert params["sessionId"].startswith("omnigent-")
+        return {"result": {"sessionId": "server-sid-1"}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    sid = await executor._ensure_session()
+    assert sid == "server-sid-1"
+
+    from omnigent.inner.qwen_executor import _session_state_path
+
+    state = json.loads(_session_state_path("conv-persist").read_text(encoding="utf-8"))
+    assert state == {"session_id": "server-sid-1", "cwd": "/ws"}
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_does_not_persist_without_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Standalone executors (no conversation key) leave no state behind."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    executor = QwenExecutor()
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        return {"result": {"sessionId": "server-sid-2"}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+    assert not (tmp_path / "qwen-acp-sessions").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_resumes_persisted_session_via_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted session id is offered to session/load before session/new."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    from omnigent.inner.qwen_executor import _session_state_path
+
+    state_path = _session_state_path("conv-resume")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({"session_id": "recorded-sid", "cwd": "/ws"}), encoding="utf-8"
+    )
+
+    executor = QwenExecutor(session_key="conv-resume", cwd="/ws")
+    executor._load_session_supported = True
+    methods: list[str] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        methods.append(method)
+        if method == "session/load":
+            assert params == {"sessionId": "recorded-sid", "cwd": "/ws"}
+            return {"result": {"configOptions": []}}
+        raise AssertionError(f"unexpected {method}")
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    sid = await executor._ensure_session()
+
+    assert sid == "recorded-sid"
+    assert executor._session_id == "recorded-sid"
+    # Restored recording already holds the folded system prompt + history.
+    assert executor._system_prompt_sent is True
+    assert methods == ["session/load"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_falls_back_to_session_new_when_load_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session/load error (e.g. recording pruned) falls back to session/new."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    from omnigent.inner.qwen_executor import _session_state_path
+
+    state_path = _session_state_path("conv-fallback")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"session_id": "gone-sid", "cwd": "/ws"}), encoding="utf-8")
+
+    executor = QwenExecutor(session_key="conv-fallback", cwd="/ws")
+    executor._load_session_supported = True
+    methods: list[str] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        methods.append(method)
+        if method == "session/load":
+            return {"error": {"code": -32002, "message": "No saved session found"}}
+        return {"result": {"sessionId": "fresh-sid"}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    sid = await executor._ensure_session()
+
+    assert sid == "fresh-sid"
+    assert executor._system_prompt_sent is False  # fresh session: fold + replay
+    assert methods == ["session/load", "session/new"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_skips_load_for_other_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state file from a different workspace is not offered to session/load."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    from omnigent.inner.qwen_executor import _session_state_path
+
+    state_path = _session_state_path("conv-cwd")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({"session_id": "other-sid", "cwd": "/old-ws"}), encoding="utf-8"
+    )
+
+    executor = QwenExecutor(session_key="conv-cwd", cwd="/new-ws")
+    executor._load_session_supported = True
+    methods: list[str] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        methods.append(method)
+        return {"result": {"sessionId": "fresh-sid"}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+    assert methods == ["session/new"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_skips_load_without_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Older qwen (no loadSession capability) goes straight to session/new."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    from omnigent.inner.qwen_executor import _session_state_path
+
+    state_path = _session_state_path("conv-noload")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"session_id": "old-sid", "cwd": "/ws"}), encoding="utf-8")
+
+    executor = QwenExecutor(session_key="conv-noload", cwd="/ws")
+    methods: list[str] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        methods.append(method)
+        return {"result": {"sessionId": "fresh-sid"}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+    assert methods == ["session/new"]

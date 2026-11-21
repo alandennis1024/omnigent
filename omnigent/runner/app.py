@@ -9789,7 +9789,9 @@ def _build_spawn_env_from_spec(
         elif harness == "hermes":
             env = _build_hermes_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "qwen":
-            env = _build_qwen_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env = _build_qwen_spawn_env(
+                effective_spec, cwd=cwd, workdir=workdir, session_id=session_id
+            )
         elif harness == "goose":
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":

@@ -1719,6 +1719,7 @@ def _build_qwen_spawn_env(
     *,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build the env-var dict the qwen harness wrap reads.
@@ -1733,6 +1734,11 @@ def _build_qwen_spawn_env(
         cache). Accepted for signature parity with the other
         ``_build_*_spawn_env`` builders; the qwen wrap does not yet
         consume a bundle dir (no skills bridge — see docs/QWEN_FOLLOWUPS.md).
+    :param session_id: Session/conversation identifier. Handed to the
+        wrap as ``HARNESS_QWEN_SESSION_ID`` so the executor can key qwen's
+        on-disk session to the conversation and resume it via ACP
+        ``session/load`` across runs (see docs/QWEN_FOLLOWUPS.md).
+        ``None`` omits the var (standalone use).
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1744,6 +1750,8 @@ def _build_qwen_spawn_env(
     # harness fall back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_QWEN_CWD.
     if cwd is not None:
         env["HARNESS_QWEN_CWD"] = str(cwd)
+    if session_id:
+        env["HARNESS_QWEN_SESSION_ID"] = session_id
 
     # Generic-provider branch (slotted ahead of the legacy-profile /
     # databricks-prefix path): a ProviderAuth on the spec, or — when the spec

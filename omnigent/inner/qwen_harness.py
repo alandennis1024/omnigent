@@ -39,6 +39,10 @@ Env vars read at startup:
   configurable cadence (``HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS``,
   default 5 min) so respawns pick up a rotated token; a mid-session auth
   failure respawns the subprocess with a fresh token and replays history.
+- ``HARNESS_QWEN_SESSION_ID``: the Omnigent conversation id, threaded by the
+  runner so the executor can key qwen's on-disk ACP session to the
+  conversation and resume it via ``session/load`` across runs. Unset in
+  standalone/test use disables resume persistence.
 """
 
 from __future__ import annotations
@@ -79,6 +83,10 @@ _ENV_OS_ENV = "HARNESS_QWEN_OS_ENV"
 # vars the qwen CLI reads. See docs/QWEN_FOLLOWUPS.md.
 _ENV_GATEWAY_BASE_URL = "HARNESS_QWEN_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_QWEN_GATEWAY_AUTH_COMMAND"
+# Conversation id threaded from the runner (see _build_qwen_spawn_env). Keys
+# the deterministic session/new hint and the on-disk session-id state file
+# used by the executor's session/load resume across runs.
+_ENV_SESSION_ID = "HARNESS_QWEN_SESSION_ID"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -148,6 +156,7 @@ def _build_qwen_executor() -> Executor:
     qwen_path = resolve_harness_path("qwen")
     gateway_base_url = os.environ.get(_ENV_GATEWAY_BASE_URL, "").strip() or None
     gateway_auth_command = os.environ.get(_ENV_GATEWAY_AUTH_COMMAND, "").strip() or None
+    session_key = os.environ.get(_ENV_SESSION_ID, "").strip() or None
 
     return QwenExecutor(
         cwd=cwd,
@@ -156,6 +165,7 @@ def _build_qwen_executor() -> Executor:
         qwen_path=qwen_path,
         gateway_base_url=gateway_base_url,
         gateway_auth_command=gateway_auth_command,
+        session_key=session_key,
     )
 
 

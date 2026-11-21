@@ -70,6 +70,18 @@ Tracks pending work and known limitations for the Qwen Code harness
   refused; missing-file reads map to qwen's ENOENT code. (Same fix applied to
   the goose ACP harness.) See the Pending item below for what's still out of
   scope (event recording / TOOL_RESULT-phase content policy).
+- **Binary document + audio attachments.** PDF and audio attachments reach
+  the agent as real ACP media blocks (see *Pending work* → Low for the wire
+  shapes): ``application/pdf`` rides an embedded ``resource`` blob, ``audio/*``
+  an ACP ``audio`` block — both gated on the matching ``promptCapabilities``
+  from the ``initialize`` handshake, with the text-marker fallback when a
+  capability is absent.
+- **ACP session resume across runs.** With the conversation id threaded as
+  ``HARNESS_QWEN_SESSION_ID``, the executor keys qwen's on-disk session to
+  the conversation and resumes it via ACP ``session/load`` on a fresh
+  process — qwen's own recording (including compaction state) survives a
+  restart instead of being rebuilt from Omnigent history. Falls back to the
+  fresh-session history replay when the recording is unavailable.
 
 ## Pending work
 
@@ -308,18 +320,51 @@ comments; this is the *what*, not the *how*.)
 
 ### Low
 
-- [ ] **More attachment types.** Text files and images now reach the agent;
-  still unsupported are binary documents (PDF, etc.) and audio input.
-- [ ] **Session resilience:** recover when the `qwen` subprocess crashes and
-  resume an ACP session across separate runs. Mid-turn cancellation now sends
+- [x] **More attachment types.** Text files and images reach the agent; PDF
+  documents and audio now do too, as real ACP media blocks. The runner
+  resolves every non-image attachment into an inline ``file_data`` data URI
+  (PDF/audio keep their true MIME), and the executor forwards them
+  out-of-band instead of leaving a ``[attached file: …]`` marker:
+  - ``audio/*`` → ACP ``{"type": "audio", "mimeType", "data"}`` (qwen
+    converts it to the model's ``input_audio`` part), gated on the
+    handshake's ``promptCapabilities.audio``.
+  - ``application/pdf`` → ACP ``{"type": "resource", "resource": {uri,
+    mimeType, "blob"}}``, gated on ``promptCapabilities.embeddedContext``;
+    qwen lifts the blob into an inline document the model receives as a
+    file part. Forwarded blocks are excluded from the text fold so they
+    aren't duplicated as markers; without the capability the old marker
+    fallback applies.
+- [x] **Session resilience: recover when the `qwen` subprocess crashes and
+  resume an ACP session across separate runs.** Mid-turn cancellation sends
   Qwen's ACP `session/cancel` notification after session setup, with SIGTERM as
   the fallback before setup or when the notification cannot be sent.
   - *Done in this pass:* dead qwen-native terminals now recreate on attach
     instead of failing 4404, so the embedded pane recovers after a crash or
     deferred-start failure.
-- [ ] **Vision/audio quality** depends on the model: text-only routes (e.g.
-  `qwen3-coder:free`) can't see forwarded images. Worth surfacing model
-  capability to users picking an agent.
+  - *Done in this pass (ACP):* the ACP harness now resumes qwen's own
+    session across runs. The runner threads the conversation id into the
+    spawn env (``HARNESS_QWEN_SESSION_ID``); the executor keys
+    ``session/new``'s id hint to it (deterministic per conversation), and
+    persists the server-assigned session id plus cwd under
+    ``$OMNIGENT_DATA_DIR/qwen-acp-sessions/``. A fresh process (new run, or
+    a respawn after a crash) with qwen's ``loadSession`` capability first
+    tries ACP ``session/load`` with the persisted id — qwen restores its
+    on-disk recording, including its compaction state and the folded system
+    prompt, so Omnigent-side history replay is skipped. Any failure
+    (recording pruned, different cwd — qwen resolves recordings per
+    project — or no capability) falls back to the existing fresh-session +
+    history-replay path. Note: under gateway routing the isolated
+    per-executor HOME holding qwen's recordings is removed in ``close()``,
+    so ``session/load`` misses there and the fallback runs.
+- [x] **Vision/audio quality** depends on the model: text-only routes (e.g.
+  `qwen3-coder:free`) can't see forwarded images. The session/new (and
+  session/load) response's ``models`` list carries per-model ``modalities``
+  (``image`` / ``pdf`` / ``audio`` / ``video``) from qwen's bundled model
+  registry; the executor matches them against the active model and, when an
+  attachment's modality is missing, opens the turn with a user-visible
+  warning that the attachment reaches the model as a text placeholder (qwen
+  itself swaps unsupported media silently). Unknown modalities stay silent
+  rather than warn spuriously.
 
 ## Known limitations & behavior
 
@@ -387,5 +432,6 @@ Spec model → provider default → catalog default; `/model` overrides via
 ### Env vars consumed by the harness wrap
 
 `HARNESS_QWEN_MODEL`, `HARNESS_QWEN_CWD`, `HARNESS_QWEN_PATH`,
-`HARNESS_QWEN_OS_ENV`, `HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS` (token
-refresh cadence for gateway routing; see "Provider routing" above).
+`HARNESS_QWEN_OS_ENV`, `HARNESS_QWEN_SESSION_ID` (conversation id for ACP
+session persistence/resume), `HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS`
+(token refresh cadence for gateway routing; see "Provider routing" above).

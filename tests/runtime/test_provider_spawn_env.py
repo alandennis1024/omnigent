@@ -1416,6 +1416,22 @@ def test_qwen_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_QWEN_MODEL"] == "gpt-default-model"
 
 
+def test_qwen_spawn_env_threads_session_id(config_home: Path) -> None:
+    """The conversation id reaches the qwen wrap as ``HARNESS_QWEN_SESSION_ID``.
+
+    The wrap keys qwen's on-disk ACP session to the conversation so a later
+    run can ``session/load`` it; no session id → no var (standalone use).
+    """
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="qwen")
+
+    env = _build_qwen_spawn_env(spec, workdir=None, session_id="conv-42")
+    assert env["HARNESS_QWEN_SESSION_ID"] == "conv-42"
+
+    env = _build_qwen_spawn_env(spec, workdir=None)
+    assert "HARNESS_QWEN_SESSION_ID" not in env
+
+
 def test_goose_spawn_env_forwards_model_and_no_gateway(config_home: Path) -> None:
     """The headless goose builder forwards a spec model as ``HARNESS_GOOSE_MODEL``
     and wires NO provider/gateway credential (Goose owns its own auth)."""
