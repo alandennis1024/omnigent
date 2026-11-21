@@ -2536,8 +2536,7 @@ async def test_run_turn_respawns_on_gateway_auth_error() -> None:
     executor._send = fake_send  # type: ignore[method-assign]
 
     events = [
-        event
-        async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+        event async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
     ]
 
     assert len(events) == 1
@@ -2580,8 +2579,7 @@ async def test_run_turn_plain_error_does_not_respawn() -> None:
     executor._send = fake_send  # type: ignore[method-assign]
 
     events = [
-        event
-        async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+        event async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
     ]
 
     assert isinstance(events[0], ExecutorError)
