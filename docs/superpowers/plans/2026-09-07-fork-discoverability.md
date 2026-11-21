@@ -2,6 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-11-21): LANDED.** All Task 1 steps shipped as commit
+> `c413104c4` — `feat(web): make conversation forking discoverable (#6698)`.
+> Verified against the tree: `Sidebar.tsx` renders the `GitForkIcon` menu item
+> and `ForkSessionDialog` behind per-row `forkOpen` state;
+> `HeaderConversationMenu`/`ChatHeader` consume `canFork`/`onFork`;
+> `Transcript.tsx` passes `actionsPersistent` to the final assistant bubble
+> and `chatBubbleParts.tsx` consumes it (footer omits resting `md:opacity-0`
+> only when persistent); the named test suites
+> (`Sidebar.rowActions`, `HeaderConversationMenu`, `ChatHeader`,
+> `ChatPage.indicators`, `Transcript.virtualList`) all exist and assert the
+> fork menu item, dialog open, and final-message persistence.
+
 **Goal:** Expose Fork in session menus and keep actions visible on the final assistant response only while the session is idle.
 
 **Architecture:** Reuse `ForkSessionDialog` and the existing AppShell fork opener. Sidebar rows own only their dialog's open flag; transcript code passes one persistent-actions boolean to the final assistant message when the session reports `idle`.
@@ -38,7 +50,7 @@
 - `VirtualBubbleList` consumes `sessionIdle: boolean`.
 - Sidebar and header actions open the existing `ForkSessionDialog` without `upToResponseId`.
 
-- [ ] **Step 1: Write failing menu tests**
+- [x] **Step 1: Write failing menu tests**
 
 Assert that:
 
@@ -50,7 +62,7 @@ expect(screen.getByTestId("fork-session-dialog")).toBeInTheDocument();
 
 Cover the sidebar menu, owner header menu, and fallback header menu.
 
-- [ ] **Step 2: Run menu tests and verify RED**
+- [x] **Step 2: Run menu tests and verify RED**
 
 Run:
 
@@ -60,7 +72,7 @@ pnpm --dir web test src/shell/Sidebar.rowActions.test.tsx src/shell/HeaderConver
 
 Expected: FAIL because no Fork menu items exist.
 
-- [ ] **Step 3: Write failing final-message action tests**
+- [x] **Step 3: Write failing final-message action tests**
 
 Render final and earlier bubbles with the proposed `actionsPersistent` prop and assert the footer's responsive classes:
 
@@ -72,7 +84,7 @@ expect(earlierFooter).toHaveClass("md:opacity-0");
 Exercise `VirtualBubbleList` with an idle final assistant bubble, a non-idle
 final assistant bubble, and a trailing user bubble.
 
-- [ ] **Step 4: Run message tests and verify RED**
+- [x] **Step 4: Run message tests and verify RED**
 
 Run:
 
@@ -82,11 +94,11 @@ pnpm --dir web test src/pages/ChatPage.indicators.test.tsx src/components/chat/T
 
 Expected: FAIL because final-message persistence is not implemented.
 
-- [ ] **Step 5: Implement the minimum menu wiring**
+- [x] **Step 5: Implement the minimum menu wiring**
 
 Add `GitForkIcon` menu items. Sidebar rows render `ForkSessionDialog` only while their local `forkOpen` state is true. The owner header menu invokes `onFork`; the fallback header dropdown is also reachable on desktop when no owner menu exists. AppShell supplies its existing full-fork opener.
 
-- [ ] **Step 6: Implement final-message persistence**
+- [x] **Step 6: Implement final-message persistence**
 
 Find the last user/assistant index in `VirtualBubbleList`. Pass:
 
@@ -100,7 +112,7 @@ Use that boolean to omit the resting `md:opacity-0` class from the assistant
 action footer while preserving its hover-to-full-opacity classes. User-message
 actions remain hover-only. Keep the existing streaming Fork gate.
 
-- [ ] **Step 7: Verify tests, types, lint, and formatting**
+- [x] **Step 7: Verify tests, types, lint, and formatting**
 
 Run:
 
@@ -113,7 +125,7 @@ pnpm --dir web format:check
 
 Expected: all commands exit 0.
 
-- [ ] **Step 8: Commit with signoff**
+- [x] **Step 8: Commit with signoff**
 
 ```bash
 git add web/src/shell/Sidebar.tsx web/src/shell/Sidebar.rowActions.test.tsx \

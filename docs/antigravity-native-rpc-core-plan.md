@@ -2,6 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-11-21): LANDED.** Tasks 1–12 are checked off against the
+> shipped code; Task 13 was not completed as written (see its header note).
+> Deviations from the plan as written:
+> - Modules landed under `omnigent/harnesses/antigravity_native/`
+>   (`rpc.py`, `steps.py`, `interactions.py`, `reader.py`) rather than the
+>   flat `omnigent/antigravity_native_*.py` paths listed below.
+> - Turn-send landed as the RPC `send_user_cascade_message`
+>   (`USER_EXPLICIT` source — the plan's tmux send-keys fallback was
+>   superseded once a user-turn RPC was confirmed).
+> - Read-mode landed as both `stream_agent_state_updates` (connect
+>   server-stream) and `get_trajectory_steps` polling.
+> - Runner wiring lives in `omnigent/runner/native/orchestration.py`, not
+>   `omnigent/runner/app.py`.
+> - Task 1's spike notes were not committed as a doc; the findings are
+>   recorded in code comments (e.g. `rpc.py` §send_user_cascade_message,
+>   referencing design-doc §10.1) and the 18 step fixtures under
+>   `tests/fixtures/antigravity/steps/` landed as planned.
+> - The agy pin has since moved well past 1.0.10 (1.5.x at the time of
+>   reconciliation); the wire shapes below remain the reference.
+
 **Goal:** Rework the antigravity-native harness runtime onto agy's connect-RPC surface — structured trajectory-step reads, interaction bridging (questions + approvals), and real interrupt — replacing the JSONL transcript-tail + send-keys-interaction core.
 
 **Architecture:** agy keeps running in a runner-owned tmux terminal (terminal-first UX). A new RPC client (extending `antigravity_native_rpc.py`) drives: read via `GetCascadeTrajectorySteps`/`StreamAgentStateUpdates`, interactions via `HandleCascadeUserInteraction` (surfaced as omnigent elicitations), and interrupt via `CancelCascadeSteps`. A pure step→item mapper replaces `step_to_events`. Turn-send stays on tmux send-keys (pending a confirmed user-turn RPC). The transcript forwarder + durable cursor are retired.
@@ -44,11 +64,11 @@
 **Interfaces:**
 - Produces: the recorded step fixtures (one per agy step type) consumed by Tasks 4–5; decisions for Tasks 2 (turn-send), 6 (poll-vs-stream).
 
-- [ ] **Step 1:** Stand up a live agy on the running omnigent (`:6767`, HOST_ID `host_1b3116a52bf74d668d3179652c54cdc7`, `HOME=/Users/bryanli`) per memory `agy-rpc-interaction-bridge.md`; discover the RPC port via `discover_language_server_port`.
-- [ ] **Step 2:** Drive turns/tools/questions to exercise each step type; save each distinct `GetCascadeTrajectorySteps` step (USER_INPUT, PLANNER_RESPONSE w/ text, PLANNER_RESPONSE w/ tool_calls incl. `ask_question`, RUN_COMMAND WAITING + DONE, other MODEL/result steps, status edges) as a fixture JSON.
-- [ ] **Step 3:** Determine turn-send: check for a user-turn RPC (e.g. a queued-user-input / `SendAllQueuedMessages` path) that records as `USER_INPUT` (not `SYSTEM_MESSAGE`). Record verdict: RPC turn-send viable, or keep tmux send-keys.
-- [ ] **Step 4:** Determine read-mode: exercise `StreamAgentStateUpdates {conversationId}` (connect server-stream framing) vs `GetCascadeTrajectorySteps` polling; record latency + reliability; pick the default (likely stream + poll fallback).
-- [ ] **Step 5:** Write findings + decisions to the notes doc; commit fixtures + notes. **Acceptance:** every step type has a fixture; turn-send + read-mode decisions are recorded with evidence.
+- [x] **Step 1:** Stand up a live agy on the running omnigent (`:6767`, HOST_ID `host_1b3116a52bf74d668d3179652c54cdc7`, `HOME=/Users/bryanli`) per memory `agy-rpc-interaction-bridge.md`; discover the RPC port via `discover_language_server_port`.
+- [x] **Step 2:** Drive turns/tools/questions to exercise each step type; save each distinct `GetCascadeTrajectorySteps` step (USER_INPUT, PLANNER_RESPONSE w/ text, PLANNER_RESPONSE w/ tool_calls incl. `ask_question`, RUN_COMMAND WAITING + DONE, other MODEL/result steps, status edges) as a fixture JSON.
+- [x] **Step 3:** Determine turn-send: check for a user-turn RPC (e.g. a queued-user-input / `SendAllQueuedMessages` path) that records as `USER_INPUT` (not `SYSTEM_MESSAGE`). Record verdict: RPC turn-send viable, or keep tmux send-keys.
+- [x] **Step 4:** Determine read-mode: exercise `StreamAgentStateUpdates {conversationId}` (connect server-stream framing) vs `GetCascadeTrajectorySteps` polling; record latency + reliability; pick the default (likely stream + poll fallback).
+- [x] **Step 5:** Write findings + decisions to the notes doc; commit fixtures + notes. **Acceptance:** every step type has a fixture; turn-send + read-mode decisions are recorded with evidence.
 
 ---
 
@@ -61,7 +81,7 @@
 **Interfaces:**
 - Produces: `get_trajectory_steps(port:int, cascade_id:str) -> list[dict]`; `cancel_cascade_steps(port:int, cascade_id:str) -> bool`. Both reuse `_rpc_url`/`_sync_client`/`_assert_loopback_url`.
 
-- [ ] **Step 1: Write failing tests** (MockTransport, mirroring `test_conversation_matches_*`):
+- [x] **Step 1: Write failing tests** (MockTransport, mirroring `test_conversation_matches_*`):
 
 ```python
 def test_get_trajectory_steps_posts_cascade_id_and_returns_steps(monkeypatch):
@@ -80,10 +100,10 @@ def test_cancel_cascade_steps_true_on_200(monkeypatch):
     assert rpc.cancel_cascade_steps(52548, "conv-uuid") is True
 ```
 
-- [ ] **Step 2: Run, verify FAIL** — `uv run --group test pytest tests/harnesses/antigravity_native/test_antigravity_native_rpc.py -k "trajectory_steps or cancel_cascade" -v` → fail (undefined).
-- [ ] **Step 3: Implement** `get_trajectory_steps` (POST `{"cascadeId": cascade_id}` to `GetCascadeTrajectorySteps`, parse `.get("steps", [])`) and `cancel_cascade_steps` (POST `{"cascadeId": cascade_id}` to `CancelCascadeSteps`, return `resp.status_code < 400`), both via `_sync_client` + `_assert_loopback_url`, mirroring `_conversation_matches`.
-- [ ] **Step 4: Run, verify PASS.**
-- [ ] **Step 5: Commit** (`feat(antigravity-native): RPC client — trajectory steps + cancel`).
+- [x] **Step 2: Run, verify FAIL** — `uv run --group test pytest tests/harnesses/antigravity_native/test_antigravity_native_rpc.py -k "trajectory_steps or cancel_cascade" -v` → fail (undefined).
+- [x] **Step 3: Implement** `get_trajectory_steps` (POST `{"cascadeId": cascade_id}` to `GetCascadeTrajectorySteps`, parse `.get("steps", [])`) and `cancel_cascade_steps` (POST `{"cascadeId": cascade_id}` to `CancelCascadeSteps`, return `resp.status_code < 400`), both via `_sync_client` + `_assert_loopback_url`, mirroring `_conversation_matches`.
+- [x] **Step 4: Run, verify PASS.**
+- [x] **Step 5: Commit** (`feat(antigravity-native): RPC client — trajectory steps + cancel`).
 
 ---
 
@@ -94,7 +114,7 @@ def test_cancel_cascade_steps_true_on_200(monkeypatch):
 **Interfaces:**
 - Produces: `handle_user_interaction(port:int, cascade_id:str, *, trajectory_id:str, step_index:int, payload:dict) -> None` (raises `AntigravityRpcError` on non-200, carrying the body so callers can detect the overloaded `"input not registered"`). `payload` is the variant dict, e.g. `{"askQuestion": {...}}` or `{"permission": {"allow": True}}`.
 
-- [ ] **Step 1: Write failing tests:**
+- [x] **Step 1: Write failing tests:**
 
 ```python
 def test_handle_user_interaction_nests_traj_and_step_inside_interaction(monkeypatch):
@@ -115,10 +135,10 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
     assert "input not registered" in str(ei.value)
 ```
 
-- [ ] **Step 2: Run, verify FAIL.**
-- [ ] **Step 3: Implement** `AntigravityRpcError(Exception)` (if absent) and `handle_user_interaction`: build `{"cascadeId": cascade_id, "interaction": {"trajectoryId": trajectory_id, "stepIndex": step_index, **payload}}`, POST to `HandleCascadeUserInteraction`; on `>= 400` raise `AntigravityRpcError(body_text)`.
-- [ ] **Step 4: Run, verify PASS.**
-- [ ] **Step 5: Commit** (`feat(antigravity-native): RPC client — handle_user_interaction`).
+- [x] **Step 2: Run, verify FAIL.**
+- [x] **Step 3: Implement** `AntigravityRpcError(Exception)` (if absent) and `handle_user_interaction`: build `{"cascadeId": cascade_id, "interaction": {"trajectoryId": trajectory_id, "stepIndex": step_index, **payload}}`, POST to `HandleCascadeUserInteraction`; on `>= 400` raise `AntigravityRpcError(body_text)`.
+- [x] **Step 4: Run, verify PASS.**
+- [x] **Step 5: Commit** (`feat(antigravity-native): RPC client — handle_user_interaction`).
 
 ---
 
@@ -130,11 +150,11 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 - Consumes: Task 1 step fixtures.
 - Produces: `map_step_to_events(step:dict, *, conversation_id:str, allocator:_ToolCallIdAllocator) -> list[OutboundEvent]` (reuses `OutboundEvent` + `_ToolCallIdAllocator` from the forwarder module, to be relocated here at cutover). Skips `USER_INPUT` steps. Emits exactly one `message` per assistant text step (NO delta).
 
-- [ ] **Step 1: Write failing tests** against the fixtures: assert PLANNER_RESPONSE text → one `external_conversation_item` `message` (role assistant, single `output_text`, **no** `output_text_delta`); USER_INPUT → `[]` (skipped — fixes user-dup); RUN_COMMAND DONE → `function_call` + `function_call_output` with `runCommand.combinedOutput.full`; status edges (RUNNING/IDLE) emitted per the verified `status` field. (Use the exact assertions from the recorded fixtures.)
-- [ ] **Step 2: Run, verify FAIL.**
-- [ ] **Step 3: Implement** `map_step_to_events` per the fixtures (port the non-delta logic from `step_to_events`; drop the delta emission and the USER_INPUT mirror; key tool-call ids via the allocator).
-- [ ] **Step 4: Run, verify PASS.**
-- [ ] **Step 5: Commit** (`feat(antigravity-native): pure step→item mapper (no delta, skip USER_INPUT)`).
+- [x] **Step 1: Write failing tests** against the fixtures: assert PLANNER_RESPONSE text → one `external_conversation_item` `message` (role assistant, single `output_text`, **no** `output_text_delta`); USER_INPUT → `[]` (skipped — fixes user-dup); RUN_COMMAND DONE → `function_call` + `function_call_output` with `runCommand.combinedOutput.full`; status edges (RUNNING/IDLE) emitted per the verified `status` field. (Use the exact assertions from the recorded fixtures.)
+- [x] **Step 2: Run, verify FAIL.**
+- [x] **Step 3: Implement** `map_step_to_events` per the fixtures (port the non-delta logic from `step_to_events`; drop the delta emission and the USER_INPUT mirror; key tool-call ids via the allocator).
+- [x] **Step 4: Run, verify PASS.**
+- [x] **Step 5: Commit** (`feat(antigravity-native): pure step→item mapper (no delta, skip USER_INPUT)`).
 
 ---
 
@@ -145,9 +165,9 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 **Interfaces:**
 - Produces: `pending_interaction(step:dict) -> PendingInteraction | None` where `PendingInteraction` = `{kind: "ask_question"|"permission", trajectory_id, step_index, spec: dict}` (spec = the `askQuestion`/`permission` block + `runCommand`/question text). Returns `None` unless `status == CORTEX_STEP_STATUS_WAITING`.
 
-- [ ] **Step 1: Write failing tests** from the WAITING fixtures: ask_question WAITING → `kind=="ask_question"`, `spec.questions[].options[].{id,text}`, `trajectory_id`/`step_index` from `metadata.sourceTrajectoryStepInfo`; run_command WAITING → `kind=="permission"`, `spec.resource.{action,target}`; DONE step → `None`.
-- [ ] **Step 2–4:** Run FAIL → implement `pending_interaction` (read `requestedInteraction`, branch on `askQuestion`/`permission`, pull ids from `metadata.sourceTrajectoryStepInfo`) → run PASS.
-- [ ] **Step 5: Commit** (`feat(antigravity-native): WAITING-interaction extractor`).
+- [x] **Step 1: Write failing tests** from the WAITING fixtures: ask_question WAITING → `kind=="ask_question"`, `spec.questions[].options[].{id,text}`, `trajectory_id`/`step_index` from `metadata.sourceTrajectoryStepInfo`; run_command WAITING → `kind=="permission"`, `spec.resource.{action,target}`; DONE step → `None`.
+- [x] **Step 2–4:** Run FAIL → implement `pending_interaction` (read `requestedInteraction`, branch on `askQuestion`/`permission`, pull ids from `metadata.sourceTrajectoryStepInfo`) → run PASS.
+- [x] **Step 5: Commit** (`feat(antigravity-native): WAITING-interaction extractor`).
 
 ---
 
@@ -159,9 +179,9 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 - Consumes: `get_trajectory_steps` (Task 2), `map_step_to_events` (Task 4), `pending_interaction` (Task 5), `_native_post_delivery.post_session_event_with_retry`.
 - Produces: `async supervise_reader(bridge_dir, session_id, *, client, poll_interval_s=...) -> None` — discovers the port, loops reading steps, maps + posts new ones (dedup by `stepIndex` identity), and hands `WAITING` steps to the interaction bridge (Task 8). Read-mode (poll vs `StreamAgentStateUpdates`) per Task 1 Step 4.
 
-- [ ] **Step 1: Write failing tests** with a fake step source (monkeypatch `get_trajectory_steps` to return a scripted sequence) + a captured post sink: assert each new step posts exactly once (re-reads dedup), USER_INPUT posts nothing, and a WAITING step invokes the bridge callback once.
-- [ ] **Step 2–4:** Run FAIL → implement the loop (dedup set over `(trajectoryId, stepIndex)`; call the bridge for WAITING) → run PASS.
-- [ ] **Step 5: Commit** (`feat(antigravity-native): RPC read driver`).
+- [x] **Step 1: Write failing tests** with a fake step source (monkeypatch `get_trajectory_steps` to return a scripted sequence) + a captured post sink: assert each new step posts exactly once (re-reads dedup), USER_INPUT posts nothing, and a WAITING step invokes the bridge callback once.
+- [x] **Step 2–4:** Run FAIL → implement the loop (dedup set over `(trajectoryId, stepIndex)`; call the bridge for WAITING) → run PASS.
+- [x] **Step 5: Commit** (`feat(antigravity-native): RPC read driver`).
 
 ---
 
@@ -172,9 +192,9 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 **Interfaces:**
 - Produces: `to_elicitation_params(pending:dict) -> ElicitationRequestParams` (ask_question → form with the options; permission → accept/decline with the command preview); `to_interaction_payload(kind:str, result:ElicitationResult, spec:dict) -> dict` (form/accept → `{"askQuestion": {"responses": [...]}}` or `{"permission": {"allow": True}}`; decline/cancel → `{"permission": {"allow": False}}`). Mirrors `_codex_elicitation.py`.
 
-- [ ] **Step 1: Write failing tests:** ask_question pending → form params with each option; an `ElicitationResult(action="accept", content={"selectedOptionIds":["2"]})` → `{"askQuestion":{"responses":[{"question":..., "selectedOptionIds":["2"]}]}}`. permission pending → accept/decline params; accept → `{"permission":{"allow":True}}`, decline → `{"permission":{"allow":False}}`.
-- [ ] **Step 2–4:** Run FAIL → implement both mappers → run PASS.
-- [ ] **Step 5: Commit** (`feat(server): antigravity elicitation adapter`).
+- [x] **Step 1: Write failing tests:** ask_question pending → form params with each option; an `ElicitationResult(action="accept", content={"selectedOptionIds":["2"]})` → `{"askQuestion":{"responses":[{"question":..., "selectedOptionIds":["2"]}]}}`. permission pending → accept/decline params; accept → `{"permission":{"allow":True}}`, decline → `{"permission":{"allow":False}}`.
+- [x] **Step 2–4:** Run FAIL → implement both mappers → run PASS.
+- [x] **Step 5: Commit** (`feat(server): antigravity elicitation adapter`).
 
 ---
 
@@ -186,9 +206,9 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 - Consumes: `pending_interaction` (Task 5), `handle_user_interaction` (Task 3), the elicitation adapter (Task 7), the server hook/registry (`_publish_and_wait_for_harness_elicitation` via a new `POST /v1/sessions/{id}/hooks/antigravity-elicitation-request`, mirroring codex).
 - Produces: `async bridge_interaction(port, cascade_id, pending, *, client, get_steps) -> None` — publishes the elicitation (deterministic id `(cascade_id, trajectory_id, step_index)`), awaits the resolution (long-poll), then **re-reads the freshest WAITING step** and POSTs `handle_user_interaction`; on the overloaded `"input not registered"` (step timed out → status ERROR), re-reads and re-publishes against the retry step.
 
-- [ ] **Step 1: Write failing tests:** (a) happy path — pending question → elicitation published → resolved("2") → `handle_user_interaction` called with the freshest step's `{trajectoryId, stepIndex}` and `askQuestion.responses[0].selectedOptionIds==["2"]`. (b) timeout path — first delivery raises `AntigravityRpcError("input not registered")` while `get_steps` now shows a NEW WAITING step at a higher index → bridge re-reads and re-delivers to the new step (assert second call uses the new `stepIndex`). (c) permission accept → `{"permission":{"allow":True}}`.
-- [ ] **Step 2–4:** Run FAIL → implement the detect→elicit→deliver loop with the re-read-on-stale handling (check step `status` to disambiguate the 500) → run PASS.
-- [ ] **Step 5: Commit** (`feat(antigravity-native): interaction bridge with timeout re-read`).
+- [x] **Step 1: Write failing tests:** (a) happy path — pending question → elicitation published → resolved("2") → `handle_user_interaction` called with the freshest step's `{trajectoryId, stepIndex}` and `askQuestion.responses[0].selectedOptionIds==["2"]`. (b) timeout path — first delivery raises `AntigravityRpcError("input not registered")` while `get_steps` now shows a NEW WAITING step at a higher index → bridge re-reads and re-delivers to the new step (assert second call uses the new `stepIndex`). (c) permission accept → `{"permission":{"allow":True}}`.
+- [x] **Step 2–4:** Run FAIL → implement the detect→elicit→deliver loop with the re-read-on-stale handling (check step `status` to disambiguate the 500) → run PASS.
+- [x] **Step 5: Commit** (`feat(antigravity-native): interaction bridge with timeout re-read`).
 
 ---
 
@@ -200,8 +220,8 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 - Consumes: Task 7 adapter, `_publish_and_wait_for_harness_elicitation`.
 - Produces: `POST /v1/sessions/{id}/hooks/antigravity-elicitation-request` — body = the pending-interaction dict; parks + awaits the verdict (deterministic id), returns the `ElicitationResult` (or 200 empty on timeout). Mirrors `POST /hooks/codex-elicitation-request`.
 
-- [ ] **Step 1–4:** TDD: failing route test (post a pending question, resolve via `/elicitations/{eid}/resolve`, assert the hook returns the verdict) → implement the route → pass.
-- [ ] **Step 5: Commit** (`feat(server): antigravity elicitation hook endpoint`).
+- [x] **Step 1–4:** TDD: failing route test (post a pending question, resolve via `/elicitations/{eid}/resolve`, assert the hook returns the verdict) → implement the route → pass.
+- [x] **Step 5: Commit** (`feat(server): antigravity elicitation hook endpoint`).
 
 ---
 
@@ -213,9 +233,9 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 - Consumes: `cancel_cascade_steps` (Task 2), port discovery, bridge state (cascade id).
 - Produces: `interrupt_session` returns `True` after a successful `CancelCascadeSteps`.
 
-- [ ] **Step 1: Write failing test:** `interrupt_session` (monkeypatched `cancel_cascade_steps` → True) returns `True`; on RPC error returns `False`.
-- [ ] **Step 2–4:** Run FAIL → implement (discover port from bridge state's conversation id, call `cancel_cascade_steps`) → run PASS.
-- [ ] **Step 5: Commit** (`feat(antigravity-native): real interrupt via CancelCascadeSteps`).
+- [x] **Step 1: Write failing test:** `interrupt_session` (monkeypatched `cancel_cascade_steps` → True) returns `True`; on RPC error returns `False`.
+- [x] **Step 2–4:** Run FAIL → implement (discover port from bridge state's conversation id, call `cancel_cascade_steps`) → run PASS.
+- [x] **Step 5: Commit** (`feat(antigravity-native): real interrupt via CancelCascadeSteps`).
 
 ---
 
@@ -227,9 +247,9 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 - Consumes: `supervise_reader` (Task 6) + the interaction bridge (Task 8).
 - Produces: the runner's antigravity auto-create starts the RPC reader (+ bridge) instead of the transcript forwarder. Single reader per session (same task-registry guard as the old forwarder).
 
-- [ ] **Step 1: Write failing test:** auto-create starts the reader task (not the forwarder); reattach/cleanup semantics preserved (mirror the existing forwarder-task tests).
-- [ ] **Step 2–4:** Run FAIL → swap the forwarder spawn for the reader spawn → run PASS.
-- [ ] **Step 5: Commit** (`feat(antigravity-native): runner auto-creates RPC reader`).
+- [x] **Step 1: Write failing test:** auto-create starts the reader task (not the forwarder); reattach/cleanup semantics preserved (mirror the existing forwarder-task tests).
+- [x] **Step 2–4:** Run FAIL → swap the forwarder spawn for the reader spawn → run PASS.
+- [x] **Step 5: Commit** (`feat(antigravity-native): runner auto-creates RPC reader`).
 
 ---
 
@@ -239,14 +259,24 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 **Interfaces:** None new — removes dead code once the reader path is green.
 
-- [ ] **Step 1:** Grep for `antigravity_native_forwarder` / `forwarded_steps` / `update_forwarded_steps` references; confirm only the reader path remains.
-- [ ] **Step 2:** Delete the forwarder module + its tests; remove the cursor fields/methods from the bridge; relocate the shared types.
-- [ ] **Step 3:** Run the full gate: `uv sync --group dev && uv run --no-sync ruff check --fix && uv run --no-sync ruff format && uv run --no-sync pyrefly check && uv run --no-sync pytest` (targeted antigravity suites + server).
-- [ ] **Step 4:** Commit (`refactor(antigravity-native): retire transcript forwarder + durable cursor (RPC reader supersedes)`).
+- [x] **Step 1:** Grep for `antigravity_native_forwarder` / `forwarded_steps` / `update_forwarded_steps` references; confirm only the reader path remains.
+- [x] **Step 2:** Delete the forwarder module + its tests; remove the cursor fields/methods from the bridge; relocate the shared types.
+- [x] **Step 3:** Run the full gate: `uv sync --group dev && uv run --no-sync ruff check --fix && uv run --no-sync ruff format && uv run --no-sync pyrefly check && uv run --no-sync pytest` (targeted antigravity suites + server).
+- [x] **Step 4:** Commit (`refactor(antigravity-native): retire transcript forwarder + durable cursor (RPC reader supersedes)`).
 
 ---
 
 ### Task 13: Live end-to-end parity verification
+
+> **Status (2026-11-21): not completed as written.** No parity script or
+> results doc was committed. Live verification instead happened in-pass
+> during the follow-up work and is recorded as `live-verified` annotations
+> in the shipped code (e.g. `reader.py` — 23 concurrent sub-agent mirrors,
+> WAITING no-op cancel; `rpc.py` — turn-send and interaction wire shapes
+> against agy 1.0.10; `bridge.py` — isolated-dir builtins), and agy has since
+> been re-pinned (1.5.x). The boxes below remain unchecked as the record of
+> that gap; the surrounding e2e suites under `tests/e2e/` cover dir GC,
+> isolated hooks, and tmux-disappearance recovery.
 
 **Files:** Create `tests/e2e/antigravity_native_rpc_e2e.py` (or a documented manual script) — gated on a live agy.
 
