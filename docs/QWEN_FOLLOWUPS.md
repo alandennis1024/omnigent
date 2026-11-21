@@ -18,11 +18,13 @@ Tracks pending work and known limitations for the Qwen Code harness
 - Auth via the CLI's own ambient credentials (see Auth model below).
 - **Provider / gateway routing (clean env).** A spec `auth:` / `providers:`
   entry is translated to `HARNESS_QWEN_GATEWAY_*` vars and the executor exports
-  `OPENAI_BASE_URL` / `OPENAI_API_KEY` (from the gateway's bearer-token command,
-  run once at session start) / `OPENAI_MODEL` into the `qwen --acp` subprocess.
-  Verified end-to-end against an OpenAI-compatible endpoint. **Caveat:** this is
-  authoritative only when qwen has no conflicting ambient `~/.qwen/settings.json`
-  — see Pending work for the precedence limitation.
+  `OPENAI_BASE_URL` / `OPENAI_API_KEY` (from the gateway's bearer-token command)
+  / `OPENAI_MODEL` into the `qwen --acp` subprocess. The subprocess also gets an
+  isolated per-executor `HOME` (created on first gateway spawn, removed in
+  `close()`) so a user-level `~/.qwen/settings.json` cannot shadow those values —
+  qwen exposes no config-dir flag, and empty-HOME isolation is what makes the
+  spec's gateway authoritative even on a host where someone ran `qwen /auth`.
+  Verified end-to-end against an OpenAI-compatible endpoint.
 - **Cost / token tracking.** Per-turn token usage is parsed from qwen's ACP
   stream and emitted on `TurnComplete.usage` (and fed to the cost observer).
   qwen rides usage out-of-band on an `agent_message_chunk` whose text is empty
@@ -243,18 +245,26 @@ comments; this is the *what*, not the *how*.)
     forwarded as `external_session_usage` (see the "Composer status line" item) —
     the recording's `newTokenCount` could feed that.
 
-- [ ] **Provider routing: settings.json precedence + token refresh.** The
-  base injection now works (see What works today), but two gaps remain before
-  it's robust on a developer machine:
-  - **Ambient settings win.** qwen prefers a user-level `~/.qwen/settings.json`
-    (`security.auth.selectedType` + `modelProviders`) over the injected
-    `OPENAI_*` env vars, so on a host where someone ran `qwen /auth`, the spec's
-    gateway is silently ignored. qwen exposes no config-dir flag, so making the
-    gateway authoritative needs HOME / config-dir isolation for the subprocess.
-  - **No token refresh.** The bearer token is snapshotted once at session start;
-    qwen has no refresh hook, so a short-lived rotating token (Databricks
-    gateway) can expire over a long session. Static keys / stable gateways are
-    unaffected.
+- [x] **Provider routing: settings.json precedence + token refresh.** The
+  base injection now works (see What works today), and the two robustness gaps
+  on a developer machine are closed:
+  - **Ambient settings win — fixed.** qwen prefers a user-level
+    `~/.qwen/settings.json` (`security.auth.selectedType` + `modelProviders`)
+    over the injected `OPENAI_*` env vars. qwen exposes no config-dir flag, so
+    the executor gives gateway-routed subprocesses an isolated per-executor
+    `HOME` (`tempfile.mkdtemp`, removed in `close()`); with no pre-existing
+    `settings.json` the spec's gateway is authoritative. Under a sandbox the
+    config-dir write root follows the isolated HOME. No gateway wired → the
+    ambient auth path is untouched.
+  - **No token refresh — fixed.** The bearer token is re-sampled on a
+    configurable cadence (`HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS`,
+    default 5 min) so respawns (model switch, crash) pick up a rotated token;
+    qwen snapshots `OPENAI_API_KEY` once at spawn, so a turn that fails with a
+    gateway auth error (401/unauthorized/expired markers) refreshes the token,
+    drops the subprocess, and resets the session latches — the retry respawns
+    with the fresh token and the fresh-session history replay carries the
+    conversation across the restart. A failed refresh keeps the previous
+    token; refresh disable via a 0/negative interval.
 - [ ] **Databricks path.** Verify the `databricks-*` profile route end-to-end
   (the env plumbing exists; only the OpenAI-compatible gateway has been tested).
   The profile route derives the base URL + auth from **ucode state**, so it
@@ -377,5 +387,5 @@ Spec model → provider default → catalog default; `/model` overrides via
 ### Env vars consumed by the harness wrap
 
 `HARNESS_QWEN_MODEL`, `HARNESS_QWEN_CWD`, `HARNESS_QWEN_PATH`,
-`HARNESS_QWEN_OS_ENV`. (Gateway/Databricks vars are computed but not yet
-consumed — see Pending work. No skills-bridge vars are emitted.)
+`HARNESS_QWEN_OS_ENV`, `HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS` (token
+refresh cadence for gateway routing; see "Provider routing" above).
