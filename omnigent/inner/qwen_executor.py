@@ -28,6 +28,8 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
@@ -75,6 +77,30 @@ _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObj
 # cases exactly this code (cli.js: ``RESOURCE_NOT_FOUND_CODE = -32002``) to
 # raise an ENOENT the model understands. Any other error code surfaces raw.
 _ACP_RESOURCE_NOT_FOUND_CODE = -32002
+
+# Bearer-token refresh cadence for gateway routing. qwen snapshots
+# OPENAI_API_KEY once at spawn, so the refreshed token applies on the next
+# respawn (model switch, crash, auth-failure recovery). Overridable for
+# gateways with unusually short-lived tokens; 0/invalid disables the loop.
+_ENV_GATEWAY_AUTH_REFRESH_MS = "HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+_DEFAULT_GATEWAY_REFRESH_SECONDS = 300.0
+
+# Markers of a gateway auth failure in an ACP error message. A match means the
+# snapshotted bearer token was rejected, so the fix is a fresh token + respawn.
+_AUTH_FAILURE_MARKERS = (
+    "401",
+    "unauthorized",
+    "invalid api key",
+    "invalid_api_key",
+    "expired",
+    "authentication",
+)
+
+
+def _looks_like_gateway_auth_error(message: str) -> bool:
+    """Heuristic: does this ACP error message mean the bearer token was rejected?"""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
 
 
 class _AcpRequestError(Exception):
@@ -248,6 +274,15 @@ class QwenExecutor(Executor):
         self._qwen_path = qwen_path or "qwen"
         self._gateway_base_url = gateway_base_url
         self._gateway_auth_command = gateway_auth_command
+        # Cached OPENAI_* env from the gateway config, refreshed periodically
+        # once a gateway is wired (see _refresh_gateway_token_loop). Empty when
+        # no gateway is configured (ambient auth path).
+        self._gateway_env: dict[str, str] = {}
+        # Per-executor isolated HOME for gateway-routed subprocesses: an empty
+        # dir whose ~/.qwen cannot shadow the injected OPENAI_* env. Created
+        # lazily on the first gateway spawn, removed in close().
+        self._gateway_home: Path | None = None
+        self._gateway_refresh_task: asyncio.Task[None] | None = None
 
         # Asyncio subprocess (created on first run_turn call).
         self._proc: asyncio.subprocess.Process | None = None
@@ -397,10 +432,12 @@ class QwenExecutor(Executor):
                 return self._qwen_path
             # qwen is an npm CLI: it must read its own install + node_modules
             # and write its config dir (~/.qwen), or it can't start
-            # inside the jail.
+            # inside the jail. Under gateway routing the subprocess HOME is
+            # isolated, so its config dir lives there (see _build_spawn_env).
             qwen_dir = Path(self._qwen_path).resolve().parent.parent
             sandbox = with_additional_read_roots(sandbox, [qwen_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen"])
+            config_root = self._gateway_home if self._gateway_home is not None else Path.home()
+            sandbox = with_additional_write_roots(sandbox, [config_root / ".qwen"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -416,6 +453,12 @@ class QwenExecutor(Executor):
         any ambient ones. Previously ``os.environ.copy()`` handed the qwen CLI
         every host secret (#3445).
 
+        When a gateway is wired the subprocess also gets an isolated ``HOME``:
+        qwen prefers a user-level ``~/.qwen/settings.json``
+        (``security.auth.selectedType`` + ``modelProviders``) over the injected
+        ``OPENAI_*`` env, and exposes no config-dir flag, so an empty HOME is
+        what keeps the spec's gateway authoritative.
+
         Kept as a named builder so the spawn-env canary can drive the real thing
         rather than a hand-copied prefix list.
         """
@@ -423,27 +466,84 @@ class QwenExecutor(Executor):
             allow_prefixes=("QWEN_", "OPENAI_", "DASHSCOPE_"),
             extra_allowed=declared_passthrough(self._os_env),
         )
-        env.update(await self._resolve_gateway_env())
+        gateway_env = await self._resolve_gateway_env()
+        env.update(gateway_env)
+        if gateway_env:
+            env["HOME"] = str(self._gateway_isolated_home())
+            self._ensure_gateway_refresh_task()
         return env
 
-    async def _resolve_gateway_env(self) -> dict[str, str]:
-        """Build the OpenAI-compatible env qwen reads from the gateway config.
+    def _gateway_isolated_home(self) -> Path:
+        """Lazily create the per-executor HOME used for gateway-routed spawns.
 
-        When a provider/gateway is wired (base URL + a bearer-token command),
-        run the command **once** to snapshot a token and return
-        ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_MODEL``. Returns an
-        empty dict when no gateway is configured (the CLI's ambient auth path).
+        The dir starts empty: qwen creates its own ``.qwen`` inside it, and
+        with no pre-existing ``settings.json`` the ``OPENAI_*`` env vars from
+        the spec's gateway are what qwen sees. Removed in :meth:`close`.
+        """
+        if self._gateway_home is None:
+            self._gateway_home = Path(tempfile.mkdtemp(prefix="omnigent-qwen-"))
+        return self._gateway_home
 
-        The token is captured at process start; qwen has no token-refresh hook,
-        so a short-lived rotating token (e.g. the Databricks gateway) can expire
-        over a long session — restart the subprocess to refresh. See
-        docs/QWEN_FOLLOWUPS.md.
+    def _gateway_refresh_interval_seconds(self) -> float:
+        """Refresh cadence for the gateway bearer token, seconds.
 
-        :returns: The OPENAI_* overrides, or ``{}`` when no gateway is wired.
+        Reads ``HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` (millis, like
+        the other gateway harnesses); falls back to a 5-minute cadence and
+        disables periodic refresh on 0/negative/invalid values.
+        """
+        raw = os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_MS, "").strip()
+        if raw:
+            with contextlib.suppress(ValueError):
+                millis = float(raw)
+                if millis <= 0:
+                    return 0.0
+                return millis / 1000.0
+        return _DEFAULT_GATEWAY_REFRESH_SECONDS
+
+    def _ensure_gateway_refresh_task(self) -> None:
+        """Start the periodic token-refresh loop once per executor."""
+        task = self._gateway_refresh_task
+        if task is not None and not task.done():
+            return
+        if self._gateway_refresh_interval_seconds() <= 0:
+            return
+        self._gateway_refresh_task = asyncio.create_task(self._refresh_gateway_token_loop())
+
+    async def _refresh_gateway_token_loop(self) -> None:
+        """Re-run the gateway auth command periodically and cache the token.
+
+        qwen snapshots ``OPENAI_API_KEY`` once at spawn, so a live process
+        keeps its original token for its lifetime — the refreshed cache
+        applies on the next respawn (model switch, crash, or the
+        auth-failure recovery in :meth:`run_turn`). A refresh failure keeps
+        the previous token and logs; it never kills the session.
+        """
+        interval = self._gateway_refresh_interval_seconds()
+        while True:
+            await asyncio.sleep(interval)
+            await self._refresh_gateway_token_once()
+
+    async def _refresh_gateway_token_once(self) -> None:
+        """One refresh tick: re-sample the bearer token and cache it on success.
+
+        A failed command keeps the previous token and logs; it never kills
+        the session.
+        """
+        try:
+            token = await self._run_gateway_auth_command()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("qwen gateway token refresh failed; keeping previous token: %s", exc)
+            return
+        if token and self._gateway_env.get("OPENAI_API_KEY") != token:
+            logger.debug("qwen gateway token refreshed")
+            self._gateway_env = {**self._gateway_env, "OPENAI_API_KEY": token}
+
+    async def _run_gateway_auth_command(self) -> str:
+        """Run the gateway bearer-token command and return the token.
+
         :raises RuntimeError: If the auth command fails or yields no token.
         """
-        if not self._gateway_base_url or not self._gateway_auth_command:
-            return {}
+        assert self._gateway_auth_command is not None
         proc = await asyncio.create_subprocess_exec(
             "sh",
             "-c",
@@ -460,12 +560,67 @@ class QwenExecutor(Executor):
         token = out.decode("utf-8", errors="replace").strip()
         if not token:
             raise RuntimeError("qwen gateway auth command produced an empty token")
+        return token
+
+    async def _respawn_for_fresh_gateway_token(self) -> None:
+        """Refresh the cached gateway token and drop the subprocess.
+
+        Called from :meth:`run_turn` when a turn fails with a gateway auth
+        error: qwen holds the token it was spawned with, so applying a
+        refreshed token requires a respawn. The next turn re-spawns with the
+        fresh env and the fresh-session history replay carries the
+        conversation across the restart.
+        """
+        with contextlib.suppress(Exception):
+            token = await self._run_gateway_auth_command()
+            if token:
+                self._gateway_env = {**self._gateway_env, "OPENAI_API_KEY": token}
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._reader_task = None
+        self._stderr_task = None
+        if self._proc is not None:
+            with contextlib.suppress(Exception):
+                _proc.terminate_tree(self._proc)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+        self._proc = None
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._initialized = False
+
+    async def _resolve_gateway_env(self) -> dict[str, str]:
+        """Build the OpenAI-compatible env qwen reads from the gateway config.
+
+        When a provider/gateway is wired (base URL + a bearer-token command),
+        run the command to snapshot a token and return
+        ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_MODEL``. Returns an
+        empty dict when no gateway is configured (the CLI's ambient auth path).
+        The result is cached on ``self._gateway_env`` and re-sampled by the
+        periodic refresh loop, so respawns pick up a current token.
+
+        qwen snapshots ``OPENAI_API_KEY`` once at process start and has no
+        token-refresh hook, so a short-lived rotating token (e.g. the
+        Databricks gateway) needs the refresh loop plus the auth-failure
+        respawn in :meth:`run_turn` to survive a long session. See
+        docs/QWEN_FOLLOWUPS.md.
+
+        :returns: The OPENAI_* overrides, or ``{}`` when no gateway is wired.
+        :raises RuntimeError: If the auth command fails or yields no token.
+        """
+        if not self._gateway_base_url or not self._gateway_auth_command:
+            return {}
+        token = await self._run_gateway_auth_command()
         env: dict[str, str] = {
             "OPENAI_BASE_URL": self._gateway_base_url,
             "OPENAI_API_KEY": token,
         }
         if self._model:
             env["OPENAI_MODEL"] = self._model
+        self._gateway_env = env
         return env
 
     async def _read_stderr(self) -> None:
@@ -1472,6 +1627,17 @@ class QwenExecutor(Executor):
                     if "Session not found" in error_msg:
                         self._session_id = None
                         self._system_prompt_sent = False
+                    elif self._gateway_env and _looks_like_gateway_auth_error(error_msg):
+                        # The snapshotted bearer token was rejected (e.g. it
+                        # rotated out from under a long session). Refresh it
+                        # and drop the subprocess so the retry respawns with
+                        # the fresh token; the fresh-session history replay
+                        # carries the conversation across the restart.
+                        logger.warning(
+                            "qwen turn failed with gateway auth error; refreshing token and respawning: %s",
+                            error_msg,
+                        )
+                        await self._respawn_for_fresh_gateway_token()
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 # Successful completion. Attach the per-turn token usage qwen
@@ -1570,6 +1736,16 @@ class QwenExecutor(Executor):
         """Terminate the qwen subprocess and clean up."""
         with contextlib.suppress(Exception):
             self._mcp.close()
+        if self._gateway_refresh_task:
+            self._gateway_refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._gateway_refresh_task
+            self._gateway_refresh_task = None
+
+        if self._gateway_home is not None:
+            shutil.rmtree(self._gateway_home, ignore_errors=True)
+            self._gateway_home = None
+
         if self._reader_task:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

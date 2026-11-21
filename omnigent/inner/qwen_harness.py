@@ -33,7 +33,12 @@ Env vars read at startup:
   OpenAI-compatible provider/gateway routing from the spec's ``auth:`` /
   ``providers:`` config. When both are set, the executor exports
   ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_MODEL`` into the ``qwen``
-  subprocess instead of relying on the CLI's ambient auth.
+  subprocess instead of relying on the CLI's ambient auth, and gives the
+  subprocess an isolated ``HOME`` so a user-level ``~/.qwen/settings.json``
+  cannot shadow those values. The bearer token is also re-sampled on a
+  configurable cadence (``HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS``,
+  default 5 min) so respawns pick up a rotated token; a mid-session auth
+  failure respawns the subprocess with a fresh token and replays history.
 """
 
 from __future__ import annotations

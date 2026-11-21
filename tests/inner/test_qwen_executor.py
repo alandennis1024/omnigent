@@ -2374,6 +2374,242 @@ async def test_resolve_gateway_env_omits_model_when_unset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_gateway_env_caches_result() -> None:
+    """The resolved OPENAI_* env is cached for the refresh loop to mutate."""
+    executor = QwenExecutor(
+        gateway_base_url="https://gw/v1",
+        gateway_auth_command="printf '%s' cached-tok",
+    )
+    env = await executor._resolve_gateway_env()
+    assert executor._gateway_env == env
+    assert executor._gateway_env["OPENAI_API_KEY"] == "cached-tok"
+
+
+# ---------------------------------------------------------------------------
+# Gateway precedence: isolated HOME beats ambient ~/.qwen/settings.json
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_env_isolates_home_when_gateway_wired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wired gateway gives qwen an empty, per-executor HOME.
+
+    qwen prefers a user-level ``~/.qwen/settings.json`` over the injected
+    ``OPENAI_*`` env, and exposes no config-dir flag — an isolated HOME whose
+    empty ``.qwen`` cannot shadow the gateway is what makes the spec's
+    routing authoritative.
+    """
+    monkeypatch.setenv("HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "0")
+    executor = QwenExecutor(
+        model="qwen/qwen-plus",
+        gateway_base_url="https://gw.example/v1",
+        gateway_auth_command="printf '%s' sk-tok",
+    )
+    env = await executor._build_spawn_env()
+
+    assert env["OPENAI_API_KEY"] == "sk-tok"
+    home = Path(env["HOME"])
+    assert home != Path.home()
+    assert home.is_dir()
+    assert list(home.iterdir()) == [], "isolated HOME must start empty"
+    # Refresh disabled via the interval env var → no background task.
+    assert executor._gateway_refresh_task is None
+
+    await executor.close()
+    assert not home.exists(), "close() removes the isolated HOME"
+
+
+@pytest.mark.asyncio
+async def test_spawn_env_keeps_host_home_without_gateway() -> None:
+    """No gateway → ambient auth path, HOME untouched, no isolated dir."""
+    executor = QwenExecutor(model="qwen/qwen-plus")
+    env = await executor._build_spawn_env()
+    assert env["HOME"] == os.environ["HOME"]
+    assert executor._gateway_home is None
+    assert executor._gateway_refresh_task is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_env_starts_token_refresh_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a gateway wired and refresh enabled, spawning arms the refresh loop."""
+    monkeypatch.delenv("HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS", raising=False)
+    executor = QwenExecutor(
+        gateway_base_url="https://gw/v1",
+        gateway_auth_command="printf '%s' tok",
+    )
+    await executor._build_spawn_env()
+    assert executor._gateway_refresh_task is not None
+    await executor.close()
+    assert executor._gateway_refresh_task is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 300.0),
+        ("60000", 60.0),
+        ("0", 0.0),
+        ("-5", 0.0),
+        ("not-a-number", 300.0),
+    ],
+)
+def test_gateway_refresh_interval_parsing(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    """Refresh cadence env var: millis in, seconds out; invalid falls back."""
+    if raw is None:
+        monkeypatch.delenv("HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_QWEN_GATEWAY_AUTH_REFRESH_INTERVAL_MS", raw)
+    assert QwenExecutor()._gateway_refresh_interval_seconds() == expected
+
+
+# ---------------------------------------------------------------------------
+# Gateway token refresh: rotating bearer tokens survive long sessions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_once_updates_cached_token(tmp_path: Path) -> None:
+    """A successful refresh tick swaps the cached OPENAI_API_KEY."""
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-v1")
+    executor = QwenExecutor(
+        gateway_base_url="https://gw/v1",
+        gateway_auth_command=f"cat {token_file}",
+    )
+    await executor._resolve_gateway_env()
+    assert executor._gateway_env["OPENAI_API_KEY"] == "tok-v1"
+
+    token_file.write_text("tok-v2")
+    await executor._refresh_gateway_token_once()
+    assert executor._gateway_env["OPENAI_API_KEY"] == "tok-v2"
+
+
+@pytest.mark.asyncio
+async def test_refresh_once_keeps_token_on_command_failure() -> None:
+    """A failed refresh tick keeps the previous token and does not raise."""
+    executor = QwenExecutor(
+        gateway_base_url="https://gw/v1",
+        gateway_auth_command="exit 1",
+    )
+    executor._gateway_env = {"OPENAI_BASE_URL": "https://gw/v1", "OPENAI_API_KEY": "old-tok"}
+    await executor._refresh_gateway_token_once()
+    assert executor._gateway_env["OPENAI_API_KEY"] == "old-tok"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_respawns_on_gateway_auth_error() -> None:
+    """An auth-failure turn refreshes the token, drops the subprocess, stays retryable."""
+    executor = QwenExecutor(
+        model="qwen/qwen-plus",
+        gateway_base_url="https://gw/v1",
+        gateway_auth_command="printf '%s' fresh-tok",
+    )
+    executor._gateway_env = {
+        "OPENAI_BASE_URL": "https://gw/v1",
+        "OPENAI_API_KEY": "stale-tok",
+        "OPENAI_MODEL": "qwen/qwen-plus",
+    }
+    executor._initialized = True
+    executor._session_id = "sess-auth"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "error": {"code": -32603, "message": "401 Unauthorized: token expired"},
+                    }
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [
+        event
+        async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].retryable is True
+    # Subprocess dropped and session latches reset so the retry respawns
+    # with the fresh token and replays history into the new process.
+    assert executor._proc is None
+    assert executor._session_id is None
+    assert executor._system_prompt_sent is False
+    assert executor._initialized is False
+    assert executor._gateway_env["OPENAI_API_KEY"] == "fresh-tok"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_plain_error_does_not_respawn() -> None:
+    """Without gateway auth markers (or without a gateway), errors leave the process."""
+    executor = QwenExecutor(
+        gateway_base_url="https://gw/v1",
+        gateway_auth_command="printf '%s' tok",
+    )
+    executor._gateway_env = {"OPENAI_BASE_URL": "https://gw/v1", "OPENAI_API_KEY": "tok"}
+    executor._initialized = True
+    executor._session_id = "sess-plain"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "error": {"code": -32603, "message": "Something went wrong"},
+                    }
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [
+        event
+        async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+    ]
+
+    assert isinstance(events[0], ExecutorError)
+    assert executor._proc is not None
+    assert executor._session_id == "sess-plain"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("401 Unauthorized", True),
+        ("Error: 401 status code", True),
+        ("invalid api key", True),
+        ("invalid_api_key", True),
+        ("token expired", True),
+        ("Authentication failed", True),
+        ("Something went wrong", False),
+        ("Session not found: x", False),
+        ("", False),
+    ],
+)
+def test_looks_like_gateway_auth_error(message: str, expected: bool) -> None:
+    from omnigent.inner.qwen_executor import _looks_like_gateway_auth_error
+
+    assert _looks_like_gateway_auth_error(message) is expected
+
+
+@pytest.mark.asyncio
 async def test_ensure_initialized_captures_image_capability() -> None:
     """initialize handshake records promptCapabilities.image on the executor."""
     executor = QwenExecutor(model="m")
