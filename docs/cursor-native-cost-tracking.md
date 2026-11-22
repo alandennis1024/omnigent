@@ -1,6 +1,7 @@
 # Cursor-native cost / token-usage tracking
 
-**Status:** Prototype (implemented; behind a live e2e validation)
+**Status:** Validated (live e2e passed 2026-11-22 against cursor-agent
+`2026.11.22`; see §7)
 **Date:** 2026-06-25
 **Harness:** `cursor-native` (the `omnigent cursor` interactive TUI wrapper)
 
@@ -148,7 +149,20 @@ this prototype.
   captured `stop` payloads → correct `cursor_usage.jsonl`; accumulator produced
   the expected cumulative POST body; verified dedup (re-read ≠ double-count) and
   skip-empty.
-- **e2e (pending):** launch `omnigent cursor`, run a couple of turns, confirm
-  the Session-cost / token-usage popover updates in the web UI. The
-  `cursor-sdk-e2e-dev` skill spins up a live server; cursor-native needs the TUI
-  path (PTY-driven), so reuse the cursor-native e2e harness.
+- **e2e (done, live):** ran `omni cursor --server http://127.0.0.1:6767` against
+  a local server (shared `~/.omnigent/chat.db`), drove two turns through the
+  real cursor-agent `2026.11.22` TUI (model `auto`). Verified end to end:
+  - the workspace `.cursor/hooks.json` `stop` hook fired per turn and appended
+    normalized lines to `<bridge_dir>/cursor_usage.jsonl` (turn 1: in=11257,
+    out=35, cache_read=3968; turn 2: in=11346, out=18, cache_read=3968;
+    `model: "default"`);
+  - the runner poller accumulated cumulative totals and POSTed
+    `external_session_usage` (`cursor_usage_forwarder.json`: in=22603, out=53,
+    cache_read=7936);
+  - `GET /v1/sessions/{id}?include_usage=true` reports
+    `usage_by_model["default"]` with `input_tokens=14667` (inclusive input minus
+    cache-read, the documented server-side split), `output_tokens=53`,
+    `cache_read_input_tokens=7936` — feeding the same `session.usage` SSE the
+    web UI's Session-cost badge / token popover renders;
+  - cost stayed `null` ("—") because cursor's `default` id isn't
+    catalog-priced, matching the §5 limitation.
